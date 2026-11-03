@@ -87,10 +87,10 @@ The executable will be created in the `dist/` folder.
 
 If you use this software in a research article, please cite it as:
 
-> Patiño-Chávez, A. R. (2025). *FractalApp: A Python Interface for Sierpiński-Based Fractal Analysis of Time-Series Data*. 
+> *Fractal-HRV-Analyzer: A Multiscale Software Framework to Analyze Seizures via Chaos Game Mapping*
+Alma Rocio Patiño-Chavez , Gael Aguirre-Cruz , Erik Leonardo Mateos-Salgado , Salvador Quiroz-González , Federico Menéndez-Conde Lara and Erika Elizabeth Rodriguez-Torres. 
 
 **If your article is published**, update the citation to the final journal format.
-
 ---
 
 ## 📄 License
