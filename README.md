@@ -8,7 +8,7 @@ The app also calculates the fractal dimension using the box-counting algorithm a
 ### Interface Preview
 
 <p align="center">
-  <img src="preview/interfaz.gif" width="700">
+  <img src="preview/interfaz.png" width="700">
 </p>
 
 
