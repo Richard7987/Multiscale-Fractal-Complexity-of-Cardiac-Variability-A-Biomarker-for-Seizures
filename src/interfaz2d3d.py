@@ -11,8 +11,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import imageio, os
+import imageio, os, time
 
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 TRIANGLE_VERTS = np.array([
     [0,0],
@@ -61,6 +62,248 @@ PLOT_THEMES = {
         "halo": 0,
     },
 }
+
+
+class FileBrowser(tk.Toplevel):
+    """Explorador de archivos para X11, donde Tk no usa el diálogo del sistema."""
+
+    def __init__(self, parent, title, extensions, start_dir, save=False, initial=""):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=UI["bg"])
+        self.geometry("780x500")
+        self.minsize(620, 360)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        self.extensions = extensions
+        self.save = save
+        self.result = ""
+        self.entries = []
+        self.rows = []
+        self.cwd = start_dir
+
+        self.path_var = tk.StringVar(master=self)
+        self.search = tk.StringVar(master=self)
+        self.name_var = tk.StringVar(master=self, value=initial)
+        self.show_hidden = tk.BooleanVar(master=self, value=False)
+        self.show_all = tk.BooleanVar(master=self, value=False)
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(2, weight=1)
+
+        # Lugares
+        places = ttk.Frame(body)
+        places.grid(row=0, column=0, rowspan=5, sticky="ns", padx=(0,14))
+        ttk.Label(places, text="Places", style="Section.TLabel").pack(anchor="w", pady=(0,6))
+        for label, path in self._places():
+            ttk.Button(places, text=label, style="Place.TButton",
+                       command=lambda p=path: self._go(p)).pack(fill=tk.X, pady=1)
+
+        # Ruta
+        top = ttk.Frame(body)
+        top.grid(row=0, column=1, sticky="ew")
+        top.columnconfigure(1, weight=1)
+        ttk.Button(top, text="Up", command=lambda: self._go(os.path.dirname(self.cwd))).grid(row=0, column=0, padx=(0,6))
+        path_entry = ttk.Entry(top, textvariable=self.path_var)
+        path_entry.grid(row=0, column=1, sticky="ew")
+        path_entry.bind("<Return>", lambda e: self._go_typed())
+
+        # Búsqueda
+        bar = ttk.Frame(body)
+        bar.grid(row=1, column=1, sticky="ew", pady=8)
+        bar.columnconfigure(1, weight=1)
+        ttk.Label(bar, text="Search").grid(row=0, column=0, padx=(0,8))
+        self.search_entry = ttk.Entry(bar, textvariable=self.search)
+        self.search_entry.grid(row=0, column=1, sticky="ew", padx=(0,10))
+        self.search_entry.bind("<Return>", lambda e: self._activate_first())
+        self.search_entry.bind("<Down>", lambda e: self._focus_list())
+        ttk.Checkbutton(bar, text="All file types", variable=self.show_all, command=self._fill).grid(row=0, column=2, padx=(0,8))
+        ttk.Checkbutton(bar, text="Hidden files", variable=self.show_hidden, command=self._fill).grid(row=0, column=3)
+        self.search.trace_add("write", lambda *a: self._fill())
+
+        # Lista
+        frame = ttk.Frame(body)
+        frame.grid(row=2, column=1, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(frame, columns=("size","modified"), selectmode="browse")
+        self.tree.heading("#0", text="Name", anchor="w")
+        self.tree.heading("size", text="Size", anchor="e")
+        self.tree.heading("modified", text="Modified", anchor="w")
+        self.tree.column("#0", stretch=True, width=300)
+        self.tree.column("size", stretch=False, width=80, anchor="e")
+        self.tree.column("modified", stretch=False, width=130)
+        self.tree.tag_configure("dir", foreground="#8fbdf0")
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
+        self.tree.bind("<Double-1>", lambda e: self._activate())
+        self.tree.bind("<Return>", lambda e: self._activate())
+
+        self.message = ttk.Label(body, style="Muted.TLabel")
+        self.message.grid(row=3, column=1, sticky="w", pady=(6,8))
+
+        # Nombre y acciones
+        bottom = ttk.Frame(body)
+        bottom.grid(row=4, column=1, sticky="ew")
+        bottom.columnconfigure(1, weight=1)
+        ttk.Label(bottom, text="File name").grid(row=0, column=0, padx=(0,8))
+        self.name_entry = ttk.Entry(bottom, textvariable=self.name_var)
+        self.name_entry.grid(row=0, column=1, sticky="ew", padx=(0,10))
+        self.name_entry.bind("<Return>", lambda e: self._accept())
+        ttk.Button(bottom, text="Cancel", command=self.destroy).grid(row=0, column=2, padx=(0,6))
+        ttk.Button(bottom, text="Save" if save else "Open", style="Accent.TButton",
+                   command=self._accept).grid(row=0, column=3)
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.path_var.set(self.cwd)
+        self._scan(self.cwd)
+        self._fill()
+
+    def show(self):
+        self.wait_visibility()
+        self.grab_set()
+        if self.save:
+            self.name_entry.focus_set()
+            self.name_entry.selection_range(0, tk.END)
+        else:
+            self.search_entry.focus_set()
+        self.wait_window()
+        return self.result
+
+    def _places(self):
+        home = os.path.expanduser("~")
+        places = [("Home", home)]
+        if os.path.isdir(DATA_DIR):
+            places.append(("App data", DATA_DIR))
+        for name in ("Desktop", "Escritorio", "Documents", "Documentos", "Downloads", "Descargas"):
+            path = os.path.join(home, name)
+            if os.path.isdir(path):
+                places.append((name, path))
+        places.append(("Computer", os.path.abspath(os.sep)))
+        return places
+
+    def _scan(self, path):
+        entries = []
+        try:
+            with os.scandir(path) as it:
+                for item in it:
+                    try:
+                        info = item.stat()
+                        entries.append((item.name, item.is_dir(), info.st_size, info.st_mtime))
+                    except OSError:
+                        entries.append((item.name, False, None, None))
+        except OSError as e:
+            self.message.config(text=f"Cannot open folder: {e.strerror}")
+            return False
+        self.cwd = path
+        self.path_var.set(path)
+        self.entries = sorted(entries, key=lambda x: (not x[1], x[0].casefold()))
+        return True
+
+    def _go(self, path):
+        if self._scan(path):
+            self.search.set("")
+            self._fill()
+            self.tree.yview_moveto(0)
+
+    def _go_typed(self):
+        path = os.path.abspath(os.path.expanduser(self.path_var.get().strip()))
+        if os.path.isdir(path):
+            self._go(path)
+        elif os.path.isfile(path) and not self.save:
+            self.result = path
+            self.destroy()
+        else:
+            self.message.config(text=f"Not found: {path}")
+
+    def _matches(self, name, is_dir):
+        if name.startswith(".") and not self.show_hidden.get():
+            return False
+        if self.search.get().strip().casefold() not in name.casefold():
+            return False
+        return is_dir or self.show_all.get() or name.lower().endswith(self.extensions)
+
+    def _fill(self):
+        self.tree.delete(*self.tree.get_children())
+        self.rows = [e for e in self.entries if self._matches(e[0], e[1])]
+        for i, (name, is_dir, size, mtime) in enumerate(self.rows):
+            text = name + "/" if is_dir else name
+            shown_size = "" if is_dir or size is None else self._format_size(size)
+            shown_time = "" if mtime is None else time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+            self.tree.insert("", tk.END, iid=str(i), text=text, values=(shown_size, shown_time),
+                             tags=("dir",) if is_dir else ())
+        query = self.search.get().strip()
+        if self.rows:
+            self.message.config(text=f"{len(self.rows)} item{'' if len(self.rows) == 1 else 's'}")
+        elif query:
+            self.message.config(text=f'No matches for "{query}" in this folder')
+        else:
+            self.message.config(text="No matching files in this folder")
+
+    def _format_size(self, size):
+        for unit in ("B", "KB", "MB"):
+            if size < 1024:
+                return f"{size:.0f} {unit}"
+            size /= 1024
+        return f"{size:.1f} GB"
+
+    def _selected(self):
+        sel = self.tree.selection()
+        return self.rows[int(sel[0])] if sel else None
+
+    def _on_select(self):
+        row = self._selected()
+        if row and (not row[1] or not self.save):
+            self.name_var.set(row[0])
+
+    def _focus_list(self):
+        if self.rows:
+            self.tree.focus_set()
+            self.tree.selection_set("0")
+            self.tree.focus("0")
+        return "break"
+
+    def _activate_first(self):
+        if self.rows:
+            self.tree.selection_set("0")
+            self._activate()
+
+    def _activate(self):
+        row = self._selected()
+        if row and row[1]:
+            self._go(os.path.join(self.cwd, row[0]))
+        elif row:
+            self.name_var.set(row[0])
+            self._accept()
+        return "break"
+
+    def _accept(self):
+        name = self.name_var.get().strip()
+        if not name:
+            self.message.config(text="Choose a file first.")
+            return
+        path = os.path.abspath(os.path.join(self.cwd, os.path.expanduser(name)))
+        if os.path.isdir(path):
+            self.name_var.set("")
+            self._go(path)
+            return
+        if self.save:
+            if not path.lower().endswith(self.extensions):
+                path += self.extensions[0]
+            if os.path.exists(path) and not messagebox.askyesno(
+                    "Replace file", f"{os.path.basename(path)} already exists. Replace it?", parent=self):
+                return
+        elif not os.path.isfile(path):
+            self.message.config(text=f"File not found: {name}")
+            return
+        self.result = path
+        self.destroy()
 
 
 class FractalApp:
@@ -143,6 +386,7 @@ class FractalApp:
         self.kind = None
         self.mode = None
         self.dimension = None
+        self.last_dir = None
 
         self._render()
 
@@ -179,12 +423,56 @@ class FractalApp:
         style.map("TCheckbutton", background=[("active", UI["bg"])],
                   indicatorbackground=[("selected", UI["accent"])])
 
+        style.configure("Place.TButton", background=UI["bg"], foreground=UI["text"], anchor="w",
+                        bordercolor=UI["bg"], lightcolor=UI["bg"], darkcolor=UI["bg"], width=11)
+        style.map("Place.TButton", background=[("active", UI["card"])],
+                  lightcolor=[("active", UI["card"])], darkcolor=[("active", UI["card"])])
+        style.configure("TEntry", fieldbackground=UI["card"], foreground=UI["text"], insertcolor=UI["text"], padding=5)
+        style.map("TEntry", bordercolor=[("focus", UI["accent"])], lightcolor=[("focus", UI["accent"])])
+        style.configure("Treeview", background=UI["card"], fieldbackground=UI["card"], foreground=UI["text"],
+                        rowheight=26, borderwidth=0)
+        style.map("Treeview", background=[("selected", "#245fbf")], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background=UI["bg"], foreground=UI["muted"], relief="flat", padding=(6,5))
+        style.map("Treeview.Heading", background=[("active", UI["border"])])
+        style.configure("Vertical.TScrollbar", background=UI["border"], troughcolor=UI["bg"],
+                        arrowcolor=UI["muted"], bordercolor=UI["bg"])
+        style.map("Vertical.TScrollbar", background=[("active", UI["disabled"])])
+
     def _section(self, parent, text, row):
         ttk.Label(parent, text=text, style="Section.TLabel").grid(row=row, column=0, columnspan=3, sticky="w", pady=(14,5))
 
     # ---------------- Archivo ----------------
+    def _start_dir(self):
+        if self.last_dir:
+            return self.last_dir
+        return DATA_DIR if os.path.isdir(DATA_DIR) else os.path.expanduser("~")
+
+    def _uses_tk_dialogs(self):
+        return self.root.tk.call("tk", "windowingsystem") == "x11"
+
+    def _ask_open(self):
+        if self._uses_tk_dialogs():
+            fp = FileBrowser(self.root, "Open data file", (".txt", ".csv", ".dat"), self._start_dir()).show()
+        else:
+            fp = filedialog.askopenfilename(initialdir=self._start_dir(),
+                                            filetypes=[("Text or CSV", ("*.txt", "*.csv", "*.dat")), ("All", "*.*")])
+        if fp:
+            self.last_dir = os.path.dirname(fp)
+        return fp
+
+    def _ask_save(self, extension, label):
+        initial = f"sierpinski_{self.kind}_{self.mode}{extension}"
+        if self._uses_tk_dialogs():
+            fp = FileBrowser(self.root, f"Save {label}", (extension,), self._start_dir(), save=True, initial=initial).show()
+        else:
+            fp = filedialog.asksaveasfilename(initialdir=self._start_dir(), initialfile=initial,
+                                              defaultextension=extension, filetypes=[(label, f"*{extension}")])
+        if fp:
+            self.last_dir = os.path.dirname(fp)
+        return fp
+
     def browse_file(self):
-        fp = filedialog.askopenfilename(filetypes=[("Text or CSV", ("*.txt", "*.csv", "*.dat")), ("All", "*.*")])
+        fp = self._ask_open()
         if fp:
             try:
                 self.points = self._read_column(fp)
@@ -385,7 +673,7 @@ class FractalApp:
         if self.fractal is None:
             messagebox.showerror("Error", "No fractal generated.")
             return
-        fp = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG","*.png")])
+        fp = self._ask_save(".png", "PNG")
         if fp:
             self.fig.savefig(fp, dpi=300)
             self.status.set(f"Image saved: {fp}")
@@ -394,7 +682,7 @@ class FractalApp:
         if self.fractal is None or self.kind != "tetrahedron":
             messagebox.showerror("Error", "Generate a tetrahedron first.")
             return
-        fp = filedialog.asksaveasfilename(defaultextension=".gif", filetypes=[("GIF","*.gif")])
+        fp = self._ask_save(".gif", "GIF")
         if not fp: return
 
         out_dir = os.path.splitext(fp)[0] + "_frames"
