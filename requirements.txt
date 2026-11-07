@@ -3,3 +3,4 @@ pandas
 matplotlib
 imageio
 imageio-ffmpeg
+openpyxl

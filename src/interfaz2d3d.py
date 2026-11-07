@@ -13,6 +13,9 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import imageio, os, time
 
+from giroscopio_a_serie import magnitud_giroscopio
+from gaitndd_a_serie import intervalos_zancada
+
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 TRIANGLE_VERTS = np.array([
@@ -364,7 +367,7 @@ class FractalApp:
         # Instrucciones
         self._section(side, "Notes", 14)
         ttk.Label(side, style="Muted.TLabel", justify="left",
-                  text="Load a single-column data file.\nTriangle uses 3 labels.\nTetrahedron uses 4 labels.\nRandom assigns random labels."
+                  text="Load a single-column data file.\nGyroscope CSV (ParkinSenseDB) and .ts\n(gaitndd) files are converted on load.\nTriangle uses 3 labels.\nTetrahedron uses 4 labels.\nRandom assigns random labels."
                   ).grid(row=15, column=0, columnspan=3, sticky="w")
 
         # ====== Panel de gráfica ======
@@ -452,10 +455,10 @@ class FractalApp:
 
     def _ask_open(self):
         if self._uses_tk_dialogs():
-            fp = FileBrowser(self.root, "Open data file", (".txt", ".csv", ".dat"), self._start_dir()).show()
+            fp = FileBrowser(self.root, "Open data file", (".txt", ".csv", ".dat", ".ts"), self._start_dir()).show()
         else:
             fp = filedialog.askopenfilename(initialdir=self._start_dir(),
-                                            filetypes=[("Text or CSV", ("*.txt", "*.csv", "*.dat")), ("All", "*.*")])
+                                            filetypes=[("Text or CSV", ("*.txt", "*.csv", "*.dat", "*.ts")), ("All", "*.*")])
         if fp:
             self.last_dir = os.path.dirname(fp)
         return fp
@@ -475,11 +478,22 @@ class FractalApp:
         fp = self._ask_open()
         if fp:
             try:
-                self.points = self._read_column(fp)
-                self.file_label.config(text=f"{os.path.basename(fp)}\n{len(self.points):,} values")
-                self.status.set(f"{len(self.points):,} values loaded from {fp}")
+                self.points, source = self._load_series(fp)
+                note = f"\nConverted: {source}" if source else ""
+                self.file_label.config(text=f"{os.path.basename(fp)}\n{len(self.points):,} values{note}")
+                self.status.set(f"{len(self.points):,} values loaded from {fp}" + (f" ({source})" if source else ""))
             except Exception as e:
                 messagebox.showerror("Error", f"Could not load file:\n{e}")
+
+    def _load_series(self, filepath):
+        # Los formatos con convertidor se transforman al cargar; el resto se lee como una columna
+        if filepath.lower().endswith(".ts"):
+            return intervalos_zancada(filepath), "gaitndd stride intervals"
+        with open(filepath, encoding="utf-8", errors="ignore") as f:
+            first_line = f.readline()
+        if "Gyroscope" in first_line:
+            return magnitud_giroscopio(filepath), "gyroscope VMω, walking only"
+        return self._read_column(filepath), None
 
     def _read_column(self, filepath):
         try:

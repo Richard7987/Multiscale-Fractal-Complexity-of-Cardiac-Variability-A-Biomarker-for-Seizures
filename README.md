@@ -12,11 +12,13 @@
 
 FractalApp is a graphical application written in Python (Tkinter) that maps a one-dimensional time series, such as a sequence of cardiac RR intervals (heart rate variability, HRV), onto a Sierpinski triangle (2D) or a Sierpinski tetrahedron (3D) through the Chaos Game algorithm. It estimates the fractal dimension of the resulting point set by box-counting.
 
-The application was developed within the research project *Exploring the fractal complexity of cardiac variability in epilepsy*. Its purpose is to compare how completely the fractal attractor is filled by series from control subjects and from patients, including recordings from different seizure states (preictal, ictal, postictal).
+Its purpose is to compare how completely the fractal attractor is filled by series from control subjects and from patients, including recordings from different seizure states (preictal, ictal, postictal).
 
 <p align="center">
-  <img src="preview/interfaz.png" width="700" alt="FractalApp main window">
+  <img src="preview/fractal.gif" width="700" alt="Chaos Game construction of the Sierpinski triangle (2D) and tetrahedron (3D) from a control RR series">
 </p>
+
+<p align="center"><em>Sierpinski triangle and tetrahedron built point by point from <code>data/controls/N1.txt</code> (4000 RR intervals, Control mode).</em></p>
 
 ---
 
@@ -53,6 +55,7 @@ The Control and Patient modes perform the same computation. They differ only in 
 ## Features
 
 - Loads single-column time series from `.txt`, `.csv` or `.dat` files.
+- Converts gait recordings on load: ParkinSenseDB gyroscope files (`data.csv`) and PhysioNet gaitndd stride files (`.ts`). See [Supported input formats](#supported-input-formats).
 - Generates the Sierpinski triangle (2D) and the Sierpinski tetrahedron (3D).
 - Three generation modes: Control, Patient and Random.
 - Estimates the fractal dimension by box-counting in 2D and 3D.
@@ -71,11 +74,11 @@ data/
   states/          Preictal, ictal and postictal series (3000 values each), with
                    example triangle, tetrahedron and GIF outputs; RANDOM holds the
                    random-mode reference figures
-preview/           Screenshots of the interface
+preview/           Interface screenshots and fractal.gif (2D and 3D construction)
 src/
   interfaz2d3d.py        Main application
-  giroscopio_a_serie.py  Converter for gyroscope data (ParkinSenseDB), see below
-  gaitndd_a_serie.py     Converter for stride interval data (PhysioNet gaitndd), see below
+  giroscopio_a_serie.py  ParkinSenseDB gyroscope converter (used by the app and as a batch command)
+  gaitndd_a_serie.py     PhysioNet gaitndd stride converter (used by the app and as a batch command)
   Software English.rar   Packaged executable, English interface
   Software Español.rar   Packaged executable, Spanish interface
 requirements.txt
@@ -99,7 +102,9 @@ venv\Scripts\activate           # Windows
 pip install -r requirements.txt
 ```
 
-Dependencies: `numpy`, `pandas`, `matplotlib`, `imageio`, `imageio-ffmpeg`.
+Dependencies: `numpy`, `pandas`, `matplotlib`, `imageio`, `imageio-ffmpeg`, and `openpyxl` (only needed by the ParkinSenseDB batch command, which reads the demographics spreadsheet).
+
+The application imports the two converters from `src/`, so keep the three `.py` files in the same folder.
 
 ---
 
@@ -109,14 +114,22 @@ Dependencies: `numpy`, `pandas`, `matplotlib`, `imageio`, `imageio-ffmpeg`.
 python src/interfaz2d3d.py
 ```
 
-1. Click **Browse** and select a single-column data file.
+1. Click **Browse** and select a data file (see the formats below). The side panel shows the number of values and, for converted files, which conversion was applied.
 2. Under the triangle or tetrahedron section, choose **Control**, **Patient** or **Random**.
 3. The fractal dimension is shown in the side panel and above the figure.
 4. Export the result with **Save Image (PNG)** or, for the tetrahedron, **Save GIF (3D)**.
 
-### Input format
+### Supported input formats
 
-A plain text file with one numeric value per line and no header, for example RR intervals:
+The format is detected when the file is opened; no separate conversion step is needed.
+
+| File | Detected by | What the app loads |
+|---|---|---|
+| Single-column series (`.txt`, `.csv`, `.dat`) | anything not listed below | the values as they are |
+| ParkinSenseDB inertial recording (`data.csv`) | a header containing `Gyroscope` | `VM_ω = sqrt(ω_x² + ω_y² + ω_z²)` of the gyroscope, without sensor dropouts and without the standing intervals |
+| PhysioNet gaitndd record (`.ts`) | the `.ts` extension | left stride intervals, without the first 20 s and without values more than 3 SD from the median |
+
+A single-column file has one numeric value per line and no header, for example RR intervals:
 
 ```
 0.977
@@ -126,31 +139,30 @@ A plain text file with one numeric value per line and no header, for example RR 
 
 Tab- or comma-separated files are accepted as long as they contain a single column.
 
+A converted file keeps all its valid samples, so its length depends on the recording (for example, about 1800–2000 gyroscope samples for one ParkinSenseDB walk, or about 200–300 strides for one gaitndd record). Because `D` depends on the number of points, use the batch commands below when comparing groups.
+
 ---
 
-## Converting other datasets
+## Converting whole datasets
 
-Two auxiliary scripts convert gait recordings into the single-column format above, so that FractalApp can be applied outside cardiac data. They are not part of the published HRV analysis.
+The same converters can be run from the command line on a complete dataset. They write one single-column `.txt` file per subject, all with the same length `n`, sorted into one folder per group. Subjects with fewer than `n` valid samples are skipped. These files can then be opened in the app like any other series. The gait conversions are not part of the published HRV analysis.
 
-**ParkinSenseDB (inertial sensors, 100 Hz).** For each subject, computes the magnitude of the angular velocity
-
-```
-VM_ω = sqrt(ω_x² + ω_y² + ω_z²)
-```
-
-from the gyroscope, discards sensor dropouts and the standing intervals before and after each walk, concatenates the repetitions of one test, and writes `n` samples per subject, separated into control and Parkinson's disease folders.
+**ParkinSenseDB (inertial sensors, 100 Hz).** Computes `VM_ω` for every repetition of one test (A: simple walk, B: narrowing walk, C: change of direction, D: Timed Up and Go), concatenates the repetitions in order, and writes the first `n` samples of each subject into `controls/` and `parkinson/`. The demographics spreadsheet supplies each subject's group.
 
 ```bash
 python src/giroscopio_a_serie.py <Full_Dataset> <Demographic_Information.xlsx> <output_dir> [test A|B|C|D] [n=4000]
 ```
 
-**PhysioNet gaitndd (Gait Dynamics in Neuro-Degenerative Disease).** Extracts the left stride interval series, which plays the role of the RR interval in gait (one value per cycle). It removes the first 20 s and the intervals more than 3 SD from the median, and writes `n` strides per subject, grouped into control, Parkinson's disease, Huntington's disease and ALS.
+**PhysioNet gaitndd (Gait Dynamics in Neuro-Degenerative Disease).** Writes the first `n` cleaned left stride intervals of each subject into `controls/`, `parkinson/`, `huntington/` and `ela/`. The stride interval plays the role of the RR interval in gait: one value per cycle.
 
 ```bash
 python src/gaitndd_a_serie.py <gaitndd/1.0.0> <output_dir> [n=190]
 ```
 
-Subjects with fewer than `n` valid samples are skipped, so that every output series has the same length.
+Notes on the data:
+
+- `VM_ω` is sampled at 100 Hz, not once per event, so consecutive samples are strongly correlated (see [Methodological notes](#methodological-notes)).
+- In both datasets the control groups are younger than the Parkinson's groups; compare them only with an adjustment for age.
 
 ---
 
@@ -161,7 +173,7 @@ pip install pyinstaller
 pyinstaller --onefile --windowed src/interfaz2d3d.py
 ```
 
-The executable is written to `dist/`. Prebuilt packages for both interface languages are provided in `src/`.
+The executable is written to `dist/`. PyInstaller includes the two converters automatically because the application imports them. The prebuilt packages for both interface languages in `src/` predate the converters and read single-column files only.
 
 ---
 
@@ -186,9 +198,3 @@ Distributed under the MIT License. See [LICENSE](LICENSE).
 Alma Rocío Patiño-Chávez — pa401981@uaeh.com
 
 Corresponding author: Erika Elizabeth Rodríguez-Torres — erikart@uaeh.edu.mx
-
----
-
-## Acknowledgements
-
-This software was developed as part of the research project *Exploring the fractal complexity of cardiac variability in epilepsy*.
