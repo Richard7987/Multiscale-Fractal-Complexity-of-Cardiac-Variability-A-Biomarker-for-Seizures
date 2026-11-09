@@ -1,7 +1,7 @@
 # FractalApp
 
 [![Tests](https://github.com/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures/actions/workflows/tests.yml/badge.svg)](https://github.com/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures/actions/workflows/tests.yml)
-[![Release](https://img.shields.io/github/v/release/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures)](https://github.com/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures/releases/latest)
+[![Release](https://img.shields.io/github/v/release/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures?sort=semver)](https://github.com/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Fractal dimension of physiological time series (heart rate variability, gait) through the Chaos Game: each series is mapped onto a Sierpinski triangle (2D) and tetrahedron (3D), and the fractal dimension `D` is estimated by box-counting.
