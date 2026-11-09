@@ -8,27 +8,18 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import imageio, os, time
+import imageio, os, time, json, csv, threading
+from datetime import datetime, timezone
 
-from giroscopio_a_serie import magnitud_giroscopio
-from gaitndd_a_serie import intervalos_zancada
+import fractal_core as fc
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
-TRIANGLE_VERTS = np.array([
-    [0,0],
-    [1,0],
-    [0.5,1]
-])
-TETRAHEDRON_VERTS = np.array([
-    [0,0,0],
-    [1,0,0],
-    [0.5,np.sqrt(3)/2,0],
-    [0.5,np.sqrt(3)/6,np.sqrt(6)/3]
-])
+TRIANGLE_VERTS = fc.TRIANGLE_VERTS
+TETRAHEDRON_VERTS = fc.TETRAHEDRON_VERTS
+ESTIMATOR_SHORT = {"classic": "Box-counting", "address": "Address counting"}
 
 MODES = ("controls", "patients", "random")
 MODE_LABELS = {"controls": "Control", "patients": "Patient", "random": "Random"}
@@ -309,12 +300,310 @@ class FileBrowser(tk.Toplevel):
         self.destroy()
 
 
+class SettingsDialog(tk.Toplevel):
+    """Opciones de análisis. Los valores por defecto reproducen el cálculo de la versión 1.0."""
+
+    FIELDS = (
+        ("outlier", "Outlier correction (robust SD, 0 = off)",
+         "Points farther than k robust standard deviations from an 11-point moving median are replaced by interpolation."),
+        ("detrend", "Detrend window (values, 0 = off)",
+         "Subtracts a moving median of this length, removing slow trends before symbolization."),
+        ("scale", "Coarse-grain scale τ (1 = off)",
+         "Averages non-overlapping windows of τ values (multiscale analysis)."),
+        ("max_n", "Use first n values (0 = all)",
+         "D depends on the number of points: compare series of equal length."),
+        ("seed", "Random-mode seed (blank = new each time)",
+         "The seed used is shown in the status bar and saved with images and statistics."),
+    )
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Analysis settings")
+        self.configure(bg=UI["bg"])
+        self.transient(app.root)
+        self.resizable(False, False)
+
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text="Analysis settings", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+
+        self.vars = {}
+        self.estimator = tk.StringVar(master=self)
+        ttk.Label(body, text="Dimension estimator").grid(row=1, column=0, sticky="w", pady=(12,0), padx=(0,12))
+        ttk.Combobox(body, textvariable=self.estimator, values=list(fc.ESTIMATORS.values()),
+                     state="readonly", width=30).grid(row=1, column=1, sticky="ew", pady=(12,0))
+        ttk.Label(body, style="Muted.TLabel", wraplength=470, justify="left",
+                  text="Classic: fixed box sizes, as in version 1.0. Address counting: counts the occupied cells "
+                       "exactly, using only the scales that n values can fill; its maximum is log k / log 2 "
+                       "(1.585 for the triangle, 2 for the tetrahedron).").grid(row=2, column=0, columnspan=2, sticky="w")
+        r = 3
+        for key, label, hint in self.FIELDS:
+            self.vars[key] = tk.StringVar(master=self)
+            ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", pady=(10,0), padx=(0,12))
+            ttk.Entry(body, textvariable=self.vars[key], width=12).grid(row=r, column=1, sticky="w", pady=(10,0))
+            ttk.Label(body, text=hint, style="Muted.TLabel", wraplength=470, justify="left").grid(row=r+1, column=0, columnspan=2, sticky="w")
+            r += 2
+        self._load(app.settings)
+
+        bar = ttk.Frame(body)
+        bar.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(16,0))
+        ttk.Button(bar, text="Reset to defaults", command=lambda: self._load(fc.Settings())).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Apply", style="Accent.TButton", command=self._apply).pack(side=tk.RIGHT)
+        ttk.Button(bar, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(0,6))
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+
+    def _load(self, s):
+        self.estimator.set(fc.ESTIMATORS[s.estimator])
+        self.vars["outlier"].set(f"{s.outlier_mad:g}")
+        self.vars["detrend"].set(str(s.detrend_window))
+        self.vars["scale"].set(str(s.scale))
+        self.vars["max_n"].set(str(s.max_n))
+        self.vars["seed"].set("" if s.seed is None else str(s.seed))
+
+    def _apply(self):
+        v = {k: var.get().strip() for k, var in self.vars.items()}
+        try:
+            settings = fc.Settings(
+                estimator=next(k for k, name in fc.ESTIMATORS.items() if name == self.estimator.get()),
+                outlier_mad=float(v["outlier"] or 0),
+                detrend_window=int(v["detrend"] or 0),
+                scale=int(v["scale"] or 1),
+                max_n=int(v["max_n"] or 0),
+                seed=int(v["seed"]) if v["seed"] else None,
+            )
+            if settings.outlier_mad < 0 or settings.detrend_window < 0 or settings.scale < 1 or settings.max_n < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid value", "Use non-negative numbers (τ ≥ 1); the seed must be an integer.", parent=self)
+            return
+        self.destroy()
+        self.app.apply_settings(settings)
+
+
+class StatisticsWindow(tk.Toplevel):
+    """Intervalo de confianza, prueba contra sustitutos, D por escala y medidas complementarias."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.results = None
+        self.title("Statistics")
+        self.configure(bg=UI["bg"])
+        self.geometry("880x760")
+        self.minsize(760, 640)
+
+        top = ttk.Frame(self, padding=(18,16,18,8))
+        top.pack(fill=tk.X)
+        for c in (1, 3, 5):
+            top.columnconfigure(c, weight=1)
+        ttk.Label(top, text="Statistics", style="Title.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
+        ttk.Label(top, style="Muted.TLabel", wraplength=820, justify="left",
+                  text=f"Series as prepared by the current settings: {len(app.points):,} values · "
+                       f"{fc.ESTIMATORS[app.settings.estimator]}.").grid(row=1, column=0, columnspan=6, sticky="w", pady=(2,8))
+
+        self.tri = tk.BooleanVar(master=self, value=True)
+        self.tet = tk.BooleanVar(master=self, value=True)
+        self.B = tk.StringVar(master=self, value="200")
+        self.block = tk.StringVar(master=self, value="")
+        self.M = tk.StringVar(master=self, value="99")
+        self.method = tk.StringVar(master=self, value="shuffle")
+        self.scales = tk.StringVar(master=self, value="1, 2, 4, 8, 16")
+        self.do_measures = tk.BooleanVar(master=self, value=True)
+
+        ttk.Checkbutton(top, text="Triangle (D2)", variable=self.tri).grid(row=2, column=0, sticky="w")
+        ttk.Checkbutton(top, text="Tetrahedron (D3)", variable=self.tet).grid(row=2, column=1, sticky="w")
+        ttk.Checkbutton(top, text="Complementary measures", variable=self.do_measures).grid(row=2, column=2, columnspan=2, sticky="w")
+        fields = (
+            ("Bootstrap replicates (0 = off)", self.B, 3, 0), ("Block length (blank = √n)", self.block, 3, 2),
+            ("Surrogates (0 = off)", self.M, 4, 0), ("Scales τ (blank = off)", self.scales, 4, 4),
+        )
+        for label, var, row, col in fields:
+            ttk.Label(top, text=label).grid(row=row, column=col, sticky="w", pady=(8,0), padx=(0,8))
+            ttk.Entry(top, textvariable=var, width=12).grid(row=row, column=col+1, sticky="ew", pady=(8,0), padx=(0,14))
+        ttk.Label(top, text="Surrogate type").grid(row=4, column=2, sticky="w", pady=(8,0), padx=(0,8))
+        ttk.Combobox(top, textvariable=self.method, values=list(fc.SURROGATES), state="readonly",
+                     width=10).grid(row=4, column=3, sticky="ew", pady=(8,0), padx=(0,14))
+
+        bar = ttk.Frame(top)
+        bar.grid(row=5, column=0, columnspan=6, sticky="ew", pady=(12,0))
+        self.btn_run = ttk.Button(bar, text="Run", style="Accent.TButton", command=self._run)
+        self.btn_run.pack(side=tk.LEFT)
+        self.btn_export = ttk.Button(bar, text="Export…", command=self._export, state=tk.DISABLED)
+        self.btn_export.pack(side=tk.LEFT, padx=(6,0))
+        self.progress = ttk.Label(bar, style="Muted.TLabel")
+        self.progress.pack(side=tk.LEFT, padx=(12,0))
+
+        box = ttk.Frame(self)
+        box.pack(fill=tk.X, padx=18)
+        self.text = tk.Text(box, height=16, bg=UI["card"], fg=UI["text"], insertbackground=UI["text"],
+                            relief="flat", font=("DejaVu Sans Mono", 10), padx=12, pady=10, wrap="word")
+        scroll = ttk.Scrollbar(box, orient=tk.VERTICAL, command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.text.insert("1.0", "Choose the analyses and press Run.\n\n"
+                                "Bootstrap: moving-block resampling of the series; 95 % percentile interval for D.\n"
+                                "Surrogates: shuffle keeps the values and destroys their order; IAAFT also keeps the "
+                                "power spectrum. z and p compare D with the surrogate distribution.\n"
+                                "Scales: D after averaging windows of τ values; n falls as τ grows.")
+        self.text.config(state=tk.DISABLED)
+
+        self.fig = plt.Figure(figsize=(8, 3.2), dpi=100, facecolor=UI["bg"])
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas.get_tk_widget().configure(highlightthickness=0, bg=UI["bg"])
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=18, pady=(10,16))
+
+    def _params(self):
+        figures = [k for k, v in (("triangle", self.tri), ("tetrahedron", self.tet)) if v.get()]
+        if not figures:
+            raise ValueError("Select at least one figure.")
+        scales = [int(s) for s in self.scales.get().replace(";", ",").split(",") if s.strip()]
+        if any(s < 1 for s in scales):
+            raise ValueError("Scales must be integers ≥ 1.")
+        B, M = int(self.B.get() or 0), int(self.M.get() or 0)
+        block = int(self.block.get()) if self.block.get().strip() else None
+        if B < 0 or M < 0 or (block is not None and block < 1):
+            raise ValueError("Use non-negative integers.")
+        return {"figures": figures, "B": B, "block": block, "M": M, "method": self.method.get(),
+                "scales": scales, "measures": self.do_measures.get()}
+
+    def _run(self):
+        try:
+            params = self._params()
+        except ValueError as e:
+            messagebox.showerror("Invalid value", str(e) or "Check the numeric fields.", parent=self)
+            return
+        settings = self.app.settings
+        seed = settings.seed if settings.seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
+        y = self.app.points.copy()
+        self.btn_run.config(state=tk.DISABLED)
+        self.btn_export.config(state=tk.DISABLED)
+        self.progress.config(text="Computing…")
+
+        def work():
+            try:
+                rng = np.random.default_rng(seed)
+                res = {"seed": seed, "n": int(len(y)), "estimator": settings.estimator, "params": params, "figures": {}}
+                for kind in params["figures"]:
+                    r = {"D": float(fc.series_dimension(y, kind, settings.estimator))}
+                    if params["B"]:
+                        r["bootstrap"] = fc.bootstrap_ci(y, kind, settings.estimator, B=params["B"], block=params["block"], rng=rng)
+                    if params["M"]:
+                        r["surrogates"] = fc.surrogate_test(y, kind, settings.estimator, M=params["M"], method=params["method"], rng=rng)
+                    if params["scales"]:
+                        r["multiscale"] = fc.multiscale(y, kind, settings.estimator, params["scales"])
+                    res["figures"][kind] = r
+                if params["measures"]:
+                    res["measures"] = fc.measures(y)
+                self.after(0, lambda: self._done(res))
+            except Exception as e:
+                self.after(0, lambda: self._failed(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _failed(self, error):
+        self.btn_run.config(state=tk.NORMAL)
+        self.progress.config(text="")
+        messagebox.showerror("Error", str(error), parent=self)
+
+    def _done(self, res):
+        self.results = res
+        self.btn_run.config(state=tk.NORMAL)
+        self.btn_export.config(state=tk.NORMAL)
+        self.progress.config(text=f"Done · seed {res['seed']}")
+        names = {"triangle": "Triangle (D2)", "tetrahedron": "Tetrahedron (D3)"}
+        lines = [f"{os.path.basename(self.app.source_path)} · n = {res['n']:,} · {fc.ESTIMATORS[res['estimator']]} · seed {res['seed']}", ""]
+        for kind, r in res["figures"].items():
+            lines.append(names[kind])
+            lines.append(f"  D = {r['D']:.4f}")
+            if "bootstrap" in r:
+                b = r["bootstrap"]
+                lines.append(f"  95 % CI [{b['ci_low']:.4f}, {b['ci_high']:.4f}] · SE {b['se']:.4f} · bias {b['bias']:+.4f}"
+                             f"  (B = {b['B']}, block = {b['block']})")
+                if not b["ci_low"] <= r["D"] <= b["ci_high"]:
+                    lines.append("  ! D lies outside the interval: resampling bias at block joins; try a longer block.")
+            if "surrogates" in r:
+                s = r["surrogates"]
+                z = "undefined (all surrogates equal)" if np.isnan(s["z"]) else f"{s['z']:.2f}"
+                lines.append(f"  Surrogates ({s['method']}, M = {s['M']}): mean {s['surrogate_mean']:.4f} ± {s['surrogate_sd']:.4f}, "
+                             f"z = {z}, p = {s['p']:.3f}")
+            if "multiscale" in r:
+                lines.append("  Scales: " + "  ".join(f"τ={m['scale']}: {m['D']:.3f} (n={m['n']})" for m in r["multiscale"]))
+            lines.append("")
+        if "measures" in res:
+            m = res["measures"]
+            lines.append("Complementary measures")
+            lines.append(f"  mean {m['mean']:.4g} · SD {m['sd']:.4g} · CV {m['cv']:.4g} · RMSSD {m['rmssd']:.4g}")
+            lines.append(f"  DFA α {m['dfa_alpha']:.3f} · sample entropy (m = 2, r = 0.2 SD) {m['sample_entropy']:.3f}")
+        if res["estimator"] == "classic" and any("multiscale" in r for r in res["figures"].values()):
+            lines.append("\nNote: the classic estimator depends on n, which falls with τ; address counting is better suited to compare scales.")
+        self.text.config(state=tk.NORMAL)
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", "\n".join(lines))
+        self.text.config(state=tk.DISABLED)
+        self._plot(res)
+
+    def _plot(self, res):
+        self.fig.clf()
+        series = [(k, r["multiscale"]) for k, r in res["figures"].items() if "multiscale" in r]
+        if not series:
+            self.canvas.draw()
+            return
+        ax = self.fig.add_subplot(111)
+        ax.set_facecolor(UI["bg"])
+        colors = {"triangle": "#4a94e6", "tetrahedron": "#e4604b"}
+        for kind, ms in series:
+            ax.plot([m["scale"] for m in ms], [m["D"] for m in ms], marker="o", color=colors[kind],
+                    label="D2 (triangle)" if kind == "triangle" else "D3 (tetrahedron)")
+        ax.set_xscale("log", base=2)
+        ax.set_xticks([m["scale"] for m in series[0][1]], [str(m["scale"]) for m in series[0][1]])
+        ax.set_xlabel("Scale τ (values averaged)", color=UI["muted"])
+        ax.set_ylabel("D", color=UI["muted"])
+        ax.tick_params(colors=UI["muted"])
+        for spine in ax.spines.values():
+            spine.set_color(UI["border"])
+        ax.grid(color=UI["border"], linewidth=0.5)
+        ax.legend(facecolor=UI["card"], edgecolor=UI["border"], labelcolor=UI["text"])
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def _export(self):
+        fp = self.app._ask_save(".json", "JSON", initial="fractal_statistics.json")
+        if not fp:
+            return
+        meta = {"fractalapp_version": fc.__version__, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "input_file": self.app.source_path, "conversion": self.app.source,
+                "settings": self.app.settings.to_dict(), "preprocessing": self.app.prep_info, "results": self.results}
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        # Versión plana en CSV: una fila por magnitud
+        rows = [("n", self.results["n"]), ("seed", self.results["seed"]), ("estimator", self.results["estimator"])]
+        for kind, r in self.results["figures"].items():
+            tag = "D2" if kind == "triangle" else "D3"
+            rows.append((tag, r["D"]))
+            for k, v in r.get("bootstrap", {}).items():
+                rows.append((f"{tag}_bootstrap_{k}", v))
+            for k, v in r.get("surrogates", {}).items():
+                rows.append((f"{tag}_surrogate_{k}", v))
+            for m in r.get("multiscale", []):
+                rows.append((f"{tag}_scale{m['scale']}", m["D"]))
+        rows += [(k, v) for k, v in self.results.get("measures", {}).items()]
+        with open(os.path.splitext(fp)[0] + ".csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["quantity", "value"])
+            w.writerows(rows)
+        self.progress.config(text=f"Exported {os.path.basename(fp)} and .csv")
+
+
 class FractalApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Fractal Generator - Sierpinski Triangle & Tetrahedron")
-        self.root.geometry("1150x720")
-        self.root.minsize(900, 720)
+        self.root.geometry("1150x800")
+        self.root.minsize(900, 780)
         self.root.configure(bg=UI["bg"])
         self._setup_style()
 
@@ -335,40 +624,48 @@ class FractalApp:
         self.file_label = ttk.Label(side, text="No file loaded", style="Muted.TLabel", wraplength=270)
         self.file_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6,0))
 
+        # Análisis: opciones y estadística
+        self._section(side, "Analysis", 4)
+        ttk.Button(side, text="Settings…", command=self.open_settings).grid(row=5, column=0, columnspan=2, sticky="ew", padx=(0,3))
+        self.btn_stats = ttk.Button(side, text="Statistics…", command=self.open_statistics, state=tk.DISABLED)
+        self.btn_stats.grid(row=5, column=2, sticky="ew", padx=(3,0))
+        self.settings_label = ttk.Label(side, style="Muted.TLabel", wraplength=270, justify="left")
+        self.settings_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(6,0))
+
         # ---- Botones de fractales ----
-        self._section(side, "Sierpinski Triangle (2D)", 4)
-        self._section(side, "Sierpinski Tetrahedron (3D)", 6)
+        self._section(side, "Sierpinski Triangle (2D)", 7)
+        self._section(side, "Sierpinski Tetrahedron (3D)", 9)
         for col, mode in enumerate(MODES):
             pad = (0 if col == 0 else 3, 0 if col == 2 else 3)
             ttk.Button(side, text=MODE_LABELS[mode], style=f"{mode}.TButton",
-                       command=lambda m=mode: self.generate_triangle(m)).grid(row=5, column=col, sticky="ew", padx=pad)
+                       command=lambda m=mode: self.generate_triangle(m)).grid(row=8, column=col, sticky="ew", padx=pad)
             ttk.Button(side, text=MODE_LABELS[mode], style=f"{mode}.TButton",
-                       command=lambda m=mode: self.generate_tetrahedron(m)).grid(row=7, column=col, sticky="ew", padx=pad)
+                       command=lambda m=mode: self.generate_tetrahedron(m)).grid(row=10, column=col, sticky="ew", padx=pad)
 
         # Dimensión fractal
-        self._section(side, "Fractal Dimension", 8)
+        self._section(side, "Fractal Dimension", 11)
         card = ttk.Frame(side, style="Card.TFrame", padding=(14,8))
-        card.grid(row=9, column=0, columnspan=3, sticky="ew")
+        card.grid(row=12, column=0, columnspan=3, sticky="ew")
         self.dim_label = ttk.Label(card, text="-", style="Metric.TLabel")
         self.dim_label.pack(anchor="w")
         self.dim_caption = ttk.Label(card, text="Box-counting estimate", style="CardMuted.TLabel")
         self.dim_caption.pack(anchor="w")
 
         # Guardar
-        self._section(side, "Save", 10)
+        self._section(side, "Save", 13)
         self.btn_image = ttk.Button(side, text="Save Image (PNG)", command=self.save_image, state=tk.DISABLED)
-        self.btn_image.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(0,4))
+        self.btn_image.grid(row=14, column=0, columnspan=3, sticky="ew", pady=(0,4))
         self.btn_gif = ttk.Button(side, text="Save GIF (3D)", command=self.save_gif, state=tk.DISABLED)
-        self.btn_gif.grid(row=12, column=0, columnspan=3, sticky="ew")
+        self.btn_gif.grid(row=15, column=0, columnspan=3, sticky="ew")
         self.light_plot = tk.BooleanVar(master=self.root, value=False)
         ttk.Checkbutton(side, text="White plot background", variable=self.light_plot,
-                        command=self._render).grid(row=13, column=0, columnspan=3, sticky="w", pady=(8,0))
+                        command=self._render).grid(row=16, column=0, columnspan=3, sticky="w", pady=(8,0))
 
         # Instrucciones
-        self._section(side, "Notes", 14)
+        self._section(side, "Notes", 17)
         ttk.Label(side, style="Muted.TLabel", justify="left",
-                  text="Load a single-column data file.\nGyroscope CSV (ParkinSenseDB) and .ts\n(gaitndd) files are converted on load.\nTriangle uses 3 labels.\nTetrahedron uses 4 labels.\nRandom assigns random labels."
-                  ).grid(row=15, column=0, columnspan=3, sticky="w")
+                  text="Single-column files; gyroscope CSV and .ts\nfiles are converted on load. Triangle uses 3\nlabels, tetrahedron 4, Random random labels.\nSaved images get a .json with all parameters."
+                  ).grid(row=18, column=0, columnspan=3, sticky="w")
 
         # ====== Panel de gráfica ======
         self.frame_plot = ttk.Frame(main)
@@ -384,13 +681,20 @@ class FractalApp:
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # Variables
+        self.settings = fc.Settings()
+        self.raw = None
         self.points = None
+        self.prep_info = {}
+        self.source = None
+        self.source_path = None
+        self.seed_used = None
         self.fractal = None
         self.kind = None
         self.mode = None
         self.dimension = None
         self.last_dir = None
 
+        self._update_settings_label()
         self._render()
 
     # ---------------- Estilo ----------------
@@ -432,6 +736,12 @@ class FractalApp:
                   lightcolor=[("active", UI["card"])], darkcolor=[("active", UI["card"])])
         style.configure("TEntry", fieldbackground=UI["card"], foreground=UI["text"], insertcolor=UI["text"], padding=5)
         style.map("TEntry", bordercolor=[("focus", UI["accent"])], lightcolor=[("focus", UI["accent"])])
+        style.configure("TCombobox", fieldbackground=UI["card"], background=UI["card"], foreground=UI["text"],
+                        arrowcolor=UI["muted"], padding=4)
+        style.map("TCombobox", fieldbackground=[("readonly", UI["card"])], foreground=[("readonly", UI["text"])],
+                  selectbackground=[("readonly", UI["card"])], selectforeground=[("readonly", UI["text"])])
+        self.root.option_add("*TCombobox*Listbox.background", UI["card"])
+        self.root.option_add("*TCombobox*Listbox.foreground", UI["text"])
         style.configure("Treeview", background=UI["card"], fieldbackground=UI["card"], foreground=UI["text"],
                         rowheight=26, borderwidth=0)
         style.map("Treeview", background=[("selected", "#245fbf")], foreground=[("selected", "#ffffff")])
@@ -463,8 +773,8 @@ class FractalApp:
             self.last_dir = os.path.dirname(fp)
         return fp
 
-    def _ask_save(self, extension, label):
-        initial = f"sierpinski_{self.kind}_{self.mode}{extension}"
+    def _ask_save(self, extension, label, initial=None):
+        initial = initial or f"sierpinski_{self.kind}_{self.mode}{extension}"
         if self._uses_tk_dialogs():
             fp = FileBrowser(self.root, f"Save {label}", (extension,), self._start_dir(), save=True, initial=initial).show()
         else:
@@ -478,113 +788,77 @@ class FractalApp:
         fp = self._ask_open()
         if fp:
             try:
-                self.points, source = self._load_series(fp)
-                note = f"\nConverted: {source}" if source else ""
-                self.file_label.config(text=f"{os.path.basename(fp)}\n{len(self.points):,} values{note}")
-                self.status.set(f"{len(self.points):,} values loaded from {fp}" + (f" ({source})" if source else ""))
+                self.raw, self.source = fc.load_series(fp)
+                self.source_path = fp
+                self._prepare()
+                self.btn_stats.config(state=tk.NORMAL)
+                self.status.set(f"{len(self.raw):,} values loaded from {fp}" + (f" ({self.source})" if self.source else ""))
             except Exception as e:
                 messagebox.showerror("Error", f"Could not load file:\n{e}")
 
-    def _load_series(self, filepath):
-        # Los formatos con convertidor se transforman al cargar; el resto se lee como una columna
-        if filepath.lower().endswith(".ts"):
-            return intervalos_zancada(filepath), "gaitndd stride intervals"
-        with open(filepath, encoding="utf-8", errors="ignore") as f:
-            first_line = f.readline()
-        if "Gyroscope" in first_line:
-            return magnitud_giroscopio(filepath), "gyroscope VMω, walking only"
-        return self._read_column(filepath), None
+    def _prepare(self):
+        # Aplica el preprocesamiento elegido a la serie cargada
+        self.points, self.prep_info = fc.preprocess(self.raw, self.settings)
+        lines = [os.path.basename(self.source_path), f"{self.prep_info['n_raw']:,} values"]
+        if self.prep_info["n_used"] != self.prep_info["n_raw"]:
+            lines[1] += f" · {self.prep_info['n_used']:,} used"
+        if self.prep_info["n_nonfinite_removed"]:
+            lines.append(f"{self.prep_info['n_nonfinite_removed']:,} missing values removed")
+        if self.prep_info["n_outliers_corrected"]:
+            lines.append(f"{self.prep_info['n_outliers_corrected']:,} outliers corrected")
+        if self.source:
+            lines.append(f"Converted: {self.source}")
+        self.file_label.config(text="\n".join(lines))
 
-    def _read_column(self, filepath):
-        try:
-            y = pd.read_csv(filepath, sep="\t", header=None, engine="python").values.squeeze()
-        except Exception:
-            try:
-                y = pd.read_csv(filepath, header=None).values.squeeze()
-            except Exception:
-                y = np.loadtxt(filepath)
-        return np.asarray(y).reshape(-1)
+    def _update_settings_label(self):
+        s = self.settings
+        steps = []
+        if s.outlier_mad > 0: steps.append(f"outliers > {s.outlier_mad:g} SD")
+        if s.detrend_window > 1: steps.append(f"detrend {s.detrend_window}")
+        if s.scale > 1: steps.append(f"scale τ = {s.scale}")
+        if s.max_n > 0: steps.append(f"first {s.max_n:,} values")
+        seed = f" · seed {s.seed}" if s.seed is not None else ""
+        self.settings_label.config(text=f"{ESTIMATOR_SHORT[s.estimator]}{seed}\n" + (", ".join(steps) if steps else "No preprocessing"))
 
-    # ---------------- TRIÁNGULO ----------------
+    # ---------------- FRACTALES ----------------
     def generate_triangle(self, mode):
-        if self.points is None:
-            messagebox.showerror("Error", "Please load a data file first.")
-            return
+        self._generate("triangle", mode)
 
-        Y = self.points
-        p = len(Y)
-        if p < 3:
-            messagebox.showerror("Error", "Need at least 3 values.")
-            return
-
-        arr = np.column_stack((Y, np.zeros(p)))
-
-        if mode == "random":
-            np.random.shuffle(arr)
-            arr[:,1] = np.random.randint(1, 4, size=p)
-        else:
-            idx = np.argsort(arr[:,0])
-            Y2 = arr[idx]
-            t = p // 3
-            Y2[:t,1]=1; Y2[t:2*t,1]=2; Y2[2*t:,1]=3
-            arr = Y2[np.argsort(idx)]
-
-        # Vértices del triángulo
-        p1, p2, p3 = TRIANGLE_VERTS
-        current = np.array([0.5,0.5])
-        pts = np.zeros((p,2))
-
-        for f in range(p):
-            lab = int(arr[f,1])
-            if lab==1: current=(current+p1)/2
-            elif lab==2: current=(current+p2)/2
-            else: current=(current+p3)/2
-            pts[f,:]=current
-
-        self._show("triangle", mode, pts, self._box_counting_2d(pts))
-
-    # ---------------- TETRAEDRO ----------------
     def generate_tetrahedron(self, mode):
+        self._generate("tetrahedron", mode)
+
+    def _generate(self, kind, mode):
         if self.points is None:
             messagebox.showerror("Error", "Please load a data file first.")
             return
-
-        Y = self.points
-        p = len(Y)
-        if p < 4:
-            messagebox.showerror("Error", "Need at least 4 values.")
+        k = 3 if kind == "triangle" else 4
+        if len(self.points) < k:
+            messagebox.showerror("Error", f"Need at least {k} values.")
             return
-
-        arr = np.column_stack((Y, np.zeros(p)))
-
         if mode == "random":
-            arr[:,1] = np.random.randint(1, 5, size=p)
+            self.seed_used = self.settings.seed if self.settings.seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
+            labels = fc.random_symbols(len(self.points), k, np.random.default_rng(self.seed_used))
         else:
-            idx = np.argsort(arr[:,0])
-            Y2 = arr[idx]
-            t = p // 4
-            Y2[:t,1]=1; Y2[t:2*t,1]=2; Y2[2*t:3*t,1]=3; Y2[3*t:,1]=4
-            arr = Y2[np.argsort(idx)]
-
-        verts = TETRAHEDRON_VERTS
-        current = np.array([0.5,np.sqrt(3)/6,np.sqrt(6)/12])
-        pts = np.zeros((p,3))
-        for f in range(p):
-            v = verts[int(arr[f,1])-1]
-            current = (current+v)/2
-            pts[f,:]=current
-
-        self._show("tetrahedron", mode, pts, self._box_counting_3d(pts))
+            self.seed_used = None
+            labels = fc.symbolize(self.points, k)
+        pts = fc.chaos_game(labels, kind)
+        try:
+            D = fc.dimension(labels, kind, self.settings.estimator, pts)
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
+            return
+        self._show(kind, mode, pts, D)
 
     # ---------------- GRÁFICAS ----------------
     def _show(self, kind, mode, pts, D):
         self.kind, self.mode, self.fractal, self.dimension = kind, mode, pts, D
         name = "Triangle" if kind == "triangle" else "Tetrahedron"
         self.dim_label.config(text=f"{D:.4f}")
-        self.dim_caption.config(text=f"Box-counting · {name} · {MODE_LABELS[mode]}")
+        self.dim_caption.config(text=f"{ESTIMATOR_SHORT[self.settings.estimator]} · {name} · {MODE_LABELS[mode]}")
         self.btn_image.config(state=tk.NORMAL)
         self.btn_gif.config(state=tk.NORMAL if kind == "tetrahedron" else tk.DISABLED)
-        self.status.set(f"{name} generated from {len(pts):,} points")
+        seed = f" · seed {self.seed_used}" if self.seed_used is not None else ""
+        self.status.set(f"{name} generated from {len(pts):,} points{seed}")
         self._render()
 
     def _render(self):
@@ -662,27 +936,29 @@ class FractalApp:
     def _color_by_mode(self, mode, theme):
         return theme["colors"][mode]
 
-    def _box_counting_2d(self, pts):
-        P = (pts - pts.min(0)) / (pts.max(0)-pts.min(0))
-        sizes = np.logspace(-3, 0, 10)
-        counts = []
-        for s in sizes:
-            idx = np.floor(P/s).astype(int)
-            counts.append(len(np.unique(idx[:,0]*1000+idx[:,1])))
-        D = np.polyfit(np.log(1/sizes), np.log(counts), 1)[0]
-        return D
-
-    def _box_counting_3d(self, pts):
-        P = (pts - pts.min(0)) / (pts.max(0)-pts.min(0))
-        eps = np.logspace(np.log10(0.005), np.log10(0.3), 10)
-        N = []
-        for e in eps:
-            idx = np.floor(P/e).astype(int)
-            N.append(len(np.unique(idx[:,0]*1e6+idx[:,1]*1e3+idx[:,2])))
-        D = np.polyfit(np.log(1/eps), np.log(N), 1)[0]
-        return D
-
     # ---------------- GUARDADO ----------------
+    def _metadata(self, output):
+        return {
+            "fractalapp_version": fc.__version__,
+            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "output": os.path.basename(output),
+            "input_file": self.source_path,
+            "conversion": self.source,
+            "settings": self.settings.to_dict(),
+            "preprocessing": self.prep_info,
+            "figure": self.kind,
+            "mode": MODE_LABELS[self.mode],
+            "random_seed": self.seed_used,
+            "estimator": fc.ESTIMATORS[self.settings.estimator],
+            "dimension": float(self.dimension),
+            "points": int(len(self.fractal)),
+        }
+
+    def _write_metadata(self, output):
+        # Guarda junto a la imagen los parámetros que la generaron, para poder reproducirla
+        with open(os.path.splitext(output)[0] + ".json", "w", encoding="utf-8") as f:
+            json.dump(self._metadata(output), f, indent=2, ensure_ascii=False)
+
     def save_image(self):
         if self.fractal is None:
             messagebox.showerror("Error", "No fractal generated.")
@@ -690,7 +966,8 @@ class FractalApp:
         fp = self._ask_save(".png", "PNG")
         if fp:
             self.fig.savefig(fp, dpi=300)
-            self.status.set(f"Image saved: {fp}")
+            self._write_metadata(fp)
+            self.status.set(f"Image saved: {fp} (parameters in .json)")
 
     def save_gif(self):
         if self.fractal is None or self.kind != "tetrahedron":
@@ -717,9 +994,29 @@ class FractalApp:
             plt.imsave(os.path.join(out_dir, f"frame_{i:03d}.png"), img)
 
         imageio.mimsave(fp, frames, fps=15)
+        self._write_metadata(fp)
         self.ax.view_init(elev, azim)
         self.canvas.draw()
         self.status.set(f"GIF saved: {fp} — frames in {out_dir}")
+
+    # ---------------- ANÁLISIS ----------------
+    def open_settings(self):
+        SettingsDialog(self)
+
+    def apply_settings(self, settings):
+        self.settings = settings
+        self._update_settings_label()
+        if self.raw is None:
+            return
+        self._prepare()
+        if self.fractal is not None:
+            self._generate(self.kind, self.mode)
+
+    def open_statistics(self):
+        if self.points is None:
+            messagebox.showerror("Error", "Please load a data file first.")
+            return
+        StatisticsWindow(self)
 
     def run(self):
         self.root.mainloop()
