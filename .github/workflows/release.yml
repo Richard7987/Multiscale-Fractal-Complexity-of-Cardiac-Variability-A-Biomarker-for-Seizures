@@ -11,14 +11,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
       - name: Check that the tag matches fractal_core.__version__
         run: |
-          version=$(python -c "import sys; sys.path.insert(0, 'src'); import fractal_core; print(fractal_core.__version__)")
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/fractal_core.py)
           tag="${GITHUB_REF_NAME#v}"
           if [ "$version" != "$tag" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match fractal_core.__version__ ($version)"
@@ -40,8 +40,8 @@ jobs:
             built: dist/FractalApp
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
