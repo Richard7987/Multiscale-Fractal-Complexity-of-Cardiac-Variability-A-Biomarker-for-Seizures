@@ -1,8 +1,15 @@
 # Multiscale Fractal Complexity of Cardiac Variability: A Biomarker for Seizures
 
+[![Tests](https://github.com/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures/actions/workflows/tests.yml/badge.svg)](https://github.com/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures/actions/workflows/tests.yml)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](#installation)
+[![Version 1.1](https://img.shields.io/badge/version-1.1-blue)](#changes-in-version-11)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 **FractalApp** — Chaos Game Representation and fractal dimension analysis of physiological time series
 
 **Authors:** Alma Rocío Patiño-Chávez, Gael Aguirre-Cruz, Erik Leonardo Mateos-Salgado, Salvador Quiroz-González, Federico Menéndez-Conde Lara and Erika Elizabeth Rodríguez-Torres
+
+This is an independent fork of [analisisenales/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures](https://github.com/analisisenales/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures), maintained separately while the original authors prepare their paper. Version 1.0 and the method are their work.
 
 **Version:** 1.1
 
@@ -99,10 +106,10 @@ LICENSE
 
 ## Installation
 
-Requires Python 3 with Tkinter.
+Requires Python 3.9 or later with Tkinter. The tests run on Python 3.9, 3.12 and 3.13 on every push and pull request.
 
 ```bash
-git clone https://github.com/analisisenales/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures.git
+git clone https://github.com/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures.git
 cd Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures
 
 python -m venv venv
@@ -255,7 +262,7 @@ The executable is written to `dist/`. PyInstaller includes `fractal_core.py` and
 python -m unittest discover -s tests -v
 ```
 
-The tests check that:
+The same tests run automatically in GitHub Actions (`.github/workflows/tests.yml`) on Python 3.9, 3.12 and 3.13; the *Tests* badge at the top shows the latest result. They check that:
 
 - with the default settings the classic estimator reproduces version 1.0 (3D identical; 2D within 5 × 10⁻⁴, see below);
 - non-finite values are removed rather than ranked, and the preprocessing steps behave as described;
