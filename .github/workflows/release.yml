@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Check that the tag matches fractal_core.__version__
+        run: |
+          version=$(python -c "import sys; sys.path.insert(0, 'src'); import fractal_core; print(fractal_core.__version__)")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match fractal_core.__version__ ($version)"
+            exit 1
+          fi
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            asset: FractalApp-${{ github.ref_name }}-windows.exe
+            built: dist/FractalApp.exe
+          - os: ubuntu-22.04
+            asset: FractalApp-${{ github.ref_name }}-linux
+            built: dist/FractalApp
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --onefile --windowed --name FractalApp --paths src src/interfaz2d3d.py
+      - name: Rename
+        shell: bash
+        run: mv "${{ matrix.built }}" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --title "FractalApp $GITHUB_REF_NAME" --generate-notes
