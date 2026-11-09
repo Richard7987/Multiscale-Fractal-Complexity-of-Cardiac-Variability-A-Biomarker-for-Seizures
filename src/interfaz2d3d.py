@@ -10,12 +10,19 @@ from tkinter import font as tkfont
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import imageio, os, time, json, csv, threading
+import imageio, os, sys, time, json, csv, queue, threading, subprocess, webbrowser
 from datetime import datetime, timezone
 
 import fractal_core as fc
+import fractal_batch as fb
+import gaitndd_a_serie
+import giroscopio_a_serie
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+# En el ejecutable de PyInstaller los datos de ejemplo se extraen a sys._MEIPASS, una carpeta temporal
+BUNDLE_DIR = getattr(sys, "_MEIPASS", None)
+DATA_DIR = os.path.join(BUNDLE_DIR or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+DATA_EXTENSIONS = (".txt", ".csv", ".dat", ".ts")
+GUIDE_URL = "https://github.com/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures/blob/main/docs/guide.md"
 
 TRIANGLE_VERTS = fc.TRIANGLE_VERTS
 TETRAHEDRON_VERTS = fc.TETRAHEDRON_VERTS
@@ -58,10 +65,35 @@ PLOT_THEMES = {
 }
 
 
+def open_path(path):
+    """Abre un archivo o carpeta con el programa predeterminado del sistema."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except OSError as e:
+        messagebox.showerror("Error", f"Could not open {path}:\n{e}")
+
+
+def documents_dir():
+    home = os.path.expanduser("~")
+    for name in ("Documents", "Documentos"):
+        if os.path.isdir(os.path.join(home, name)):
+            return os.path.join(home, name)
+    return home
+
+
+def in_bundle(path):
+    return bool(BUNDLE_DIR) and os.path.abspath(path).startswith(os.path.abspath(BUNDLE_DIR))
+
+
 class FileBrowser(tk.Toplevel):
     """Explorador de archivos para X11, donde Tk no usa el diálogo del sistema."""
 
-    def __init__(self, parent, title, extensions, start_dir, save=False, initial=""):
+    def __init__(self, parent, title, extensions, start_dir, save=False, initial="", folder=False):
         super().__init__(parent)
         self.title(title)
         self.configure(bg=UI["bg"])
@@ -72,6 +104,7 @@ class FileBrowser(tk.Toplevel):
 
         self.extensions = extensions
         self.save = save
+        self.folder = folder
         self.result = ""
         self.entries = []
         self.rows = []
@@ -114,7 +147,8 @@ class FileBrowser(tk.Toplevel):
         self.search_entry.grid(row=0, column=1, sticky="ew", padx=(0,10))
         self.search_entry.bind("<Return>", lambda e: self._activate_first())
         self.search_entry.bind("<Down>", lambda e: self._focus_list())
-        ttk.Checkbutton(bar, text="All file types", variable=self.show_all, command=self._fill).grid(row=0, column=2, padx=(0,8))
+        if not folder:
+            ttk.Checkbutton(bar, text="All file types", variable=self.show_all, command=self._fill).grid(row=0, column=2, padx=(0,8))
         ttk.Checkbutton(bar, text="Hidden files", variable=self.show_hidden, command=self._fill).grid(row=0, column=3)
         self.search.trace_add("write", lambda *a: self._fill())
 
@@ -146,12 +180,12 @@ class FileBrowser(tk.Toplevel):
         bottom = ttk.Frame(body)
         bottom.grid(row=4, column=1, sticky="ew")
         bottom.columnconfigure(1, weight=1)
-        ttk.Label(bottom, text="File name").grid(row=0, column=0, padx=(0,8))
+        ttk.Label(bottom, text="Folder" if folder else "File name").grid(row=0, column=0, padx=(0,8))
         self.name_entry = ttk.Entry(bottom, textvariable=self.name_var)
         self.name_entry.grid(row=0, column=1, sticky="ew", padx=(0,10))
         self.name_entry.bind("<Return>", lambda e: self._accept())
         ttk.Button(bottom, text="Cancel", command=self.destroy).grid(row=0, column=2, padx=(0,6))
-        ttk.Button(bottom, text="Save" if save else "Open", style="Accent.TButton",
+        ttk.Button(bottom, text="Choose folder" if folder else "Save" if save else "Open", style="Accent.TButton",
                    command=self._accept).grid(row=0, column=3)
 
         self.bind("<Escape>", lambda e: self.destroy())
@@ -202,6 +236,8 @@ class FileBrowser(tk.Toplevel):
 
     def _go(self, path):
         if self._scan(path):
+            if self.folder:
+                self.name_var.set("")
             self.search.set("")
             self._fill()
             self.tree.yview_moveto(0)
@@ -221,6 +257,8 @@ class FileBrowser(tk.Toplevel):
             return False
         if self.search.get().strip().casefold() not in name.casefold():
             return False
+        if self.folder:
+            return is_dir
         return is_dir or self.show_all.get() or name.lower().endswith(self.extensions)
 
     def _fill(self):
@@ -279,6 +317,15 @@ class FileBrowser(tk.Toplevel):
 
     def _accept(self):
         name = self.name_var.get().strip()
+        if self.folder:
+            # Sin selección se elige la carpeta abierta
+            path = os.path.abspath(os.path.join(self.cwd, os.path.expanduser(name))) if name else self.cwd
+            if not os.path.isdir(path):
+                self.message.config(text=f"Folder not found: {name}")
+                return
+            self.result = path
+            self.destroy()
+            return
         if not name:
             self.message.config(text="Choose a file first.")
             return
@@ -383,7 +430,31 @@ class SettingsDialog(tk.Toplevel):
         self.app.apply_settings(settings)
 
 
-class StatisticsWindow(tk.Toplevel):
+class WorkerWindow(tk.Toplevel):
+    """Ventana con cálculos en un hilo. Llamar a Tk desde otro hilo no es fiable (after() puede no ejecutarse nunca),
+    así que el hilo deja funciones en una cola y el hilo principal las ejecuta."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.queue = queue.Queue()
+        self._poll()
+
+    def _post(self, fn):
+        self.queue.put(fn)
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        while True:
+            try:
+                fn = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            fn()
+        self.after(100, self._poll)
+
+
+class StatisticsWindow(WorkerWindow):
     """Intervalo de confianza, prueba contra sustitutos, D por escala y medidas complementarias."""
 
     def __init__(self, app):
@@ -498,9 +569,9 @@ class StatisticsWindow(tk.Toplevel):
                     res["figures"][kind] = r
                 if params["measures"]:
                     res["measures"] = fc.measures(y)
-                self.after(0, lambda: self._done(res))
+                self._post(lambda: self._done(res))
             except Exception as e:
-                self.after(0, lambda: self._failed(e))
+                self._post(lambda err=e: self._failed(err))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -598,6 +669,505 @@ class StatisticsWindow(tk.Toplevel):
         self.progress.config(text=f"Exported {os.path.basename(fp)} and .csv")
 
 
+class ToolWindow(WorkerWindow):
+    """Base de las ventanas de herramientas: pasos numerados y avisos desde un hilo de trabajo."""
+
+    def __init__(self, app, title, intro, size):
+        super().__init__(app.root)
+        self.app = app
+        self.running = False
+        self.title(title)
+        self.configure(bg=UI["bg"])
+        self.geometry(size)
+        self.body = ttk.Frame(self, padding=18)
+        self.body.pack(fill=tk.BOTH, expand=True)
+        self.body.columnconfigure(0, weight=1)
+        ttk.Label(self.body, text=title, style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.body, text=intro, style="Muted.TLabel", wraplength=int(size.split("x")[0]) - 40,
+                  justify="left").grid(row=1, column=0, sticky="w", pady=(2,0))
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _step(self, text, row):
+        ttk.Label(self.body, text=text, style="Step.TLabel").grid(row=row, column=0, sticky="w", pady=(16,6))
+
+    def _path_row(self, parent, row, var, command, label=None):
+        if label:
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0,10))
+        ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", padx=(0,6))
+        ttk.Button(parent, text="Choose…", command=command).grid(row=row, column=2)
+
+    def _close(self):
+        if self.running and not messagebox.askyesno("Stop", "The analysis is still running. Stop it and close?", parent=self):
+            return
+        self._stop()
+        self.destroy()
+
+    def _stop(self):
+        pass
+
+
+class BatchWindow(ToolWindow):
+    """Análisis por lotes con la interfaz: el mismo cálculo y la misma tabla que fractal_batch.py."""
+
+    def __init__(self, app, inputs=()):
+        super().__init__(app, "Batch analysis",
+                         "Computes the fractal dimension of every data file in the chosen folders and saves one table "
+                         "that opens in Excel or LibreOffice. Subfolders are included. Each file's group is the name "
+                         "of the folder that holds it, so put each group in its own folder (for example controls and "
+                         "patients).", "920x820")
+        self.minsize(780, 700)
+        self.cancel = threading.Event()
+        self.output = None
+        b = self.body
+
+        self._step("1   Data folders", 2)
+        box = ttk.Frame(b)
+        box.grid(row=3, column=0, sticky="ew")
+        box.columnconfigure(0, weight=1)
+        self.inputs = tk.Listbox(box, height=4, bg=UI["card"], fg=UI["text"], selectbackground="#245fbf",
+                                 relief="flat", highlightthickness=0, activestyle="none", selectmode=tk.EXTENDED)
+        self.inputs.grid(row=0, column=0, rowspan=4, sticky="nsew", padx=(0,10))
+        ttk.Button(box, text="Add folder…", command=self._add_folder).grid(row=0, column=1, sticky="ew")
+        ttk.Button(box, text="Add files…", command=self._add_files).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Button(box, text="Remove", command=self._remove).grid(row=2, column=1, sticky="ew")
+        examples = [os.path.join(DATA_DIR, g) for g in ("controls", "epileptics") if os.path.isdir(os.path.join(DATA_DIR, g))]
+        if examples:
+            ttk.Button(box, text="Use example data", command=lambda: [self._add(p) for p in examples]).grid(
+                row=3, column=1, sticky="ew", pady=(4,0))
+
+        self._step("2   What to compute", 4)
+        opts = ttk.Frame(b)
+        opts.grid(row=5, column=0, sticky="ew")
+        for c in (1, 3):
+            opts.columnconfigure(c, weight=1)
+        self.settings_label = ttk.Label(opts, style="Muted.TLabel")
+        self.settings_label.grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Button(opts, text="Settings…", command=self._settings).grid(row=0, column=3, sticky="e")
+        self.tri = tk.BooleanVar(master=self, value=True)
+        self.tet = tk.BooleanVar(master=self, value=True)
+        self.do_measures = tk.BooleanVar(master=self, value=False)
+        ttk.Checkbutton(opts, text="Triangle (D2)", variable=self.tri).grid(row=1, column=0, sticky="w", pady=(8,0))
+        ttk.Checkbutton(opts, text="Tetrahedron (D3)", variable=self.tet).grid(row=1, column=1, sticky="w", pady=(8,0))
+        ttk.Checkbutton(opts, text="Other HRV measures (mean, SD, RMSSD, DFA α, sample entropy)",
+                        variable=self.do_measures).grid(row=1, column=2, columnspan=2, sticky="w", pady=(8,0))
+        self.B = tk.StringVar(master=self, value="0")
+        self.M = tk.StringVar(master=self, value="0")
+        self.method = tk.StringVar(master=self, value="shuffle")
+        self.scales = tk.StringVar(master=self, value="")
+        fields = (("Bootstrap replicates (0 = off)", self.B, 2, 0), ("Surrogates (0 = off)", self.M, 2, 2),
+                  ("Scales τ, e.g. 1, 2, 4 (blank = off)", self.scales, 3, 0))
+        for label, var, row, col in fields:
+            ttk.Label(opts, text=label).grid(row=row, column=col, sticky="w", pady=(8,0), padx=(0,8))
+            ttk.Entry(opts, textvariable=var, width=12).grid(row=row, column=col+1, sticky="w", pady=(8,0), padx=(0,14))
+        ttk.Label(opts, text="Surrogate type").grid(row=3, column=2, sticky="w", pady=(8,0), padx=(0,8))
+        ttk.Combobox(opts, textvariable=self.method, values=list(fc.SURROGATES), state="readonly",
+                     width=10).grid(row=3, column=3, sticky="w", pady=(8,0))
+        ttk.Label(opts, style="Muted.TLabel", wraplength=860, justify="left",
+                  text="Bootstrap adds a 95 % confidence interval for D; surrogates test whether D differs from "
+                       "shuffled copies of the series (p-value). Both repeat the calculation many times per file, "
+                       "so the analysis takes longer: try 200 replicates and 99 surrogates.").grid(
+                      row=4, column=0, columnspan=4, sticky="w", pady=(8,0))
+
+        self._step("3   Results table", 6)
+        out = ttk.Frame(b)
+        out.grid(row=7, column=0, sticky="ew")
+        out.columnconfigure(1, weight=1)
+        self.output_var = tk.StringVar(master=self)
+        self._path_row(out, 0, self.output_var, self._choose_output, "Save as")
+
+        bar = ttk.Frame(b)
+        bar.grid(row=8, column=0, sticky="ew", pady=(16,8))
+        bar.columnconfigure(2, weight=1)
+        self.btn_run = ttk.Button(bar, text="Run", style="Accent.TButton", command=self._run)
+        self.btn_run.grid(row=0, column=0)
+        self.btn_stop = ttk.Button(bar, text="Stop", command=self._stop, state=tk.DISABLED)
+        self.btn_stop.grid(row=0, column=1, padx=6)
+        self.bar = ttk.Progressbar(bar, mode="determinate")
+        self.bar.grid(row=0, column=2, sticky="ew", padx=(6,0))
+        self.progress = ttk.Label(b, style="Muted.TLabel", text="Add at least one folder, then press Run.")
+        self.progress.grid(row=9, column=0, sticky="w")
+
+        cols = ("files", "D2", "D3", "errors")
+        self.tree = ttk.Treeview(b, columns=cols, height=6, selectmode="none")
+        self.tree.heading("#0", text="Group", anchor="w")
+        for c, text in zip(cols, ("Files", "D2 mean ± SD", "D3 mean ± SD", "Not read")):
+            self.tree.heading(c, text=text, anchor="w")
+            self.tree.column(c, width=150 if c.startswith("D") else 80, stretch=c.startswith("D"))
+        self.tree.grid(row=10, column=0, sticky="nsew", pady=(8,0))
+        b.rowconfigure(10, weight=1)
+
+        end = ttk.Frame(b)
+        end.grid(row=11, column=0, sticky="ew", pady=(10,0))
+        self.btn_table = ttk.Button(end, text="Open table", command=lambda: open_path(self.output), state=tk.DISABLED)
+        self.btn_table.pack(side=tk.LEFT)
+        self.btn_folder = ttk.Button(end, text="Open folder", command=lambda: open_path(os.path.dirname(self.output)),
+                                     state=tk.DISABLED)
+        self.btn_folder.pack(side=tk.LEFT, padx=6)
+
+        self._refresh_settings()
+        for p in inputs:
+            self._add(p)
+
+    def _refresh_settings(self):
+        s = self.app.settings
+        seed = f" · seed {s.seed}" if s.seed is not None else ""
+        self.settings_label.config(text=f"Current settings: {ESTIMATOR_SHORT[s.estimator]} · "
+                                        f"{self.app.preprocessing_text()}{seed}")
+
+    def _settings(self):
+        self.wait_window(SettingsDialog(self.app))
+        self._refresh_settings()
+
+    def _add(self, path):
+        if path and path not in self.inputs.get(0, tk.END):
+            self.inputs.insert(tk.END, path)
+            if not self.output_var.get():
+                base = os.path.dirname(os.path.abspath(path))
+                if os.path.isfile(path):
+                    base = os.path.dirname(base)
+                self.output_var.set(os.path.join(documents_dir() if in_bundle(base) else base, "fractal_results.csv"))
+
+    def _add_folder(self):
+        self._add(self.app._ask_folder("Add data folder", parent=self))
+
+    def _add_files(self):
+        for p in self.app._ask_open_many(parent=self):
+            self._add(p)
+
+    def _remove(self):
+        for i in reversed(self.inputs.curselection()):
+            self.inputs.delete(i)
+
+    def _choose_output(self):
+        fp = self.app._ask_save(".csv", "CSV table", initial="fractal_results.csv", parent=self)
+        if fp:
+            self.output_var.set(fp)
+
+    def _params(self):
+        figures = [k for k, v in (("triangle", self.tri), ("tetrahedron", self.tet)) if v.get()]
+        if not figures:
+            raise ValueError("Select the triangle, the tetrahedron or both.")
+        try:
+            B, M = int(self.B.get() or 0), int(self.M.get() or 0)
+            scales = [int(s) for s in self.scales.get().replace(";", ",").split(",") if s.strip()]
+        except ValueError:
+            raise ValueError("Bootstrap, surrogates and scales must be whole numbers.") from None
+        if B < 0 or M < 0 or any(s < 1 for s in scales):
+            raise ValueError("Use whole numbers ≥ 0 (scales ≥ 1).")
+        return {"figures": figures, "bootstrap": B, "surrogates": M, "surrogate_method": self.method.get(),
+                "scales": scales, "measures": self.do_measures.get()}
+
+    def _run(self):
+        inputs = list(self.inputs.get(0, tk.END))
+        output = self.output_var.get().strip()
+        try:
+            if not inputs:
+                raise ValueError("Add at least one folder or file with data.")
+            if not output:
+                raise ValueError("Choose where to save the results table.")
+            params = self._params()
+        except ValueError as e:
+            messagebox.showerror("Check the options", str(e), parent=self)
+            return
+        if not output.lower().endswith(".csv"):
+            output += ".csv"
+        if os.path.exists(output) and not messagebox.askyesno(
+                "Replace file", f"{os.path.basename(output)} already exists. Replace it?", parent=self):
+            return
+        settings = self.app.settings
+        self.output = output
+        self.cancel.clear()
+        self.running = True
+        self.btn_run.config(state=tk.DISABLED)
+        self.btn_stop.config(state=tk.NORMAL)
+        for btn in (self.btn_table, self.btn_folder):
+            btn.config(state=tk.DISABLED)
+        self.tree.delete(*self.tree.get_children())
+        self.bar.config(value=0)
+        self.progress.config(text="Looking for data files…")
+
+        def progress(i, total, path, error):
+            self._post(lambda: self._progress(i, total, path, error))
+
+        def work():
+            try:
+                rows, meta = fb.run(inputs, output, settings, seed=settings.seed, progress=progress,
+                                    cancel=self.cancel, **params)
+                self._post(lambda: self._done(rows, meta))
+            except Exception as e:
+                self._post(lambda err=e: self._failed(err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _progress(self, i, total, path, error):
+        self.bar.config(maximum=total, value=i)
+        self.progress.config(text=f"{i} of {total} files · {os.path.basename(path)}" + (" (could not be read)" if error else ""))
+
+    def _stop(self):
+        self.cancel.set()
+
+    def _finish(self):
+        self.running = False
+        self.btn_run.config(state=tk.NORMAL)
+        self.btn_stop.config(state=tk.DISABLED)
+
+    def _failed(self, error):
+        self._finish()
+        self.progress.config(text="")
+        messagebox.showerror("Error", str(error), parent=self)
+
+    def _done(self, rows, meta):
+        self._finish()
+
+        def cell(item, tag):
+            if tag not in item:
+                return "—"
+            mean, sd, n = item[tag]
+            return f"{mean:.4f}" if n == 1 else f"{mean:.4f} ± {sd:.4f}"
+
+        for item in fb.summarize(rows):
+            self.tree.insert("", tk.END, text=item["group"],
+                             values=(item["files"], cell(item, "D2"), cell(item, "D3"), item["errors"] or ""))
+        errors = sum("error" in r for r in rows)
+        text = f"Stopped after {meta['files']} of {meta['files_found']} files." if meta["cancelled"] \
+            else f"Done: {meta['files']} files."
+        text += f" Saved {os.path.basename(self.output)} and a .json with the settings (seed {meta['seed']})."
+        if errors:
+            text += f" {errors} file{'s' if errors > 1 else ''} could not be read; see the error column of the table."
+        self.progress.config(text=text)
+        for btn in (self.btn_table, self.btn_folder):
+            btn.config(state=tk.NORMAL)
+
+
+class ConvertWindow(ToolWindow):
+    """Convierte un dataset de marcha completo en un archivo por sujeto, ordenado por grupo."""
+
+    DATASETS = {
+        "parkinsense": ("ParkinSenseDB · gyroscope recordings, 100 Hz", 4000,
+                        "The Full_Dataset folder, which holds one folder per subject."),
+        "gaitndd": ("PhysioNet gaitndd · stride intervals", 190,
+                    "The folder with the .ts records (for example gaitndd/1.0.0)."),
+    }
+    TESTS = ("A · simple walk", "B · narrowing walk", "C · change of direction", "D · Timed Up and Go")
+
+    def __init__(self, app):
+        super().__init__(app, "Convert a gait dataset",
+                         "Turns a public gait dataset into one single-column file per subject, all with the same "
+                         "number of values and sorted into one folder per group, ready for batch analysis. A single "
+                         "recording does not need this: the main window converts it when you open it.", "820x760")
+        self.minsize(700, 660)
+        self.output = None
+        b = self.body
+
+        self._step("1   Dataset", 2)
+        self.dataset = tk.StringVar(master=self, value="parkinsense")
+        for i, (key, (label, _, _)) in enumerate(self.DATASETS.items()):
+            ttk.Radiobutton(b, text=label, value=key, variable=self.dataset,
+                            command=self._switch).grid(row=3 + i, column=0, sticky="w")
+
+        self._step("2   Input", 5)
+        form = ttk.Frame(b)
+        form.grid(row=6, column=0, sticky="ew")
+        form.columnconfigure(1, weight=1)
+        self.source = tk.StringVar(master=self)
+        self.demographics = tk.StringVar(master=self)
+        self.test = tk.StringVar(master=self, value=self.TESTS[0])
+        self.n = tk.StringVar(master=self)
+        self._path_row(form, 0, self.source, self._choose_source, "Dataset folder")
+        self.source_hint = ttk.Label(form, style="Muted.TLabel")
+        self.source_hint.grid(row=1, column=1, columnspan=2, sticky="w", pady=(2,8))
+        self.pk_rows = []
+        self._path_row(form, 2, self.demographics, self._choose_demographics, "Demographics")
+        self.pk_rows += form.grid_slaves(row=2)
+        hint = ttk.Label(form, style="Muted.TLabel", text="Demographic_Information.xlsx: it gives each subject's group.")
+        hint.grid(row=3, column=1, columnspan=2, sticky="w", pady=(2,8))
+        test_label = ttk.Label(form, text="Test")
+        test_label.grid(row=4, column=0, sticky="w", padx=(0,10))
+        test_box = ttk.Combobox(form, textvariable=self.test, values=self.TESTS, state="readonly", width=26)
+        test_box.grid(row=4, column=1, sticky="w", pady=(0,8))
+        self.pk_rows += [hint, test_label, test_box]
+        ttk.Label(form, text="Values per subject").grid(row=5, column=0, sticky="w", padx=(0,10))
+        ttk.Entry(form, textvariable=self.n, width=10).grid(row=5, column=1, sticky="w")
+        ttk.Label(form, style="Muted.TLabel", wraplength=600, justify="left",
+                  text="Every file gets this many values, because the classic estimate of D depends on the number "
+                       "of values. Subjects with fewer valid values are skipped.").grid(
+                      row=6, column=1, columnspan=2, sticky="w", pady=(2,0))
+
+        self._step("3   Output folder", 7)
+        out = ttk.Frame(b)
+        out.grid(row=8, column=0, sticky="ew")
+        out.columnconfigure(1, weight=1)
+        self.output_var = tk.StringVar(master=self)
+        self._path_row(out, 0, self.output_var, self._choose_output, "Save in")
+
+        bar = ttk.Frame(b)
+        bar.grid(row=9, column=0, sticky="ew", pady=(16,8))
+        bar.columnconfigure(1, weight=1)
+        self.btn_run = ttk.Button(bar, text="Convert", style="Accent.TButton", command=self._run)
+        self.btn_run.grid(row=0, column=0)
+        self.bar = ttk.Progressbar(bar, mode="determinate")
+        self.bar.grid(row=0, column=1, sticky="ew", padx=(12,0))
+
+        self.log = tk.Text(b, height=8, bg=UI["card"], fg=UI["text"], relief="flat", padx=10, pady=8,
+                           font=("DejaVu Sans Mono", 9), wrap="word", state=tk.DISABLED)
+        self.log.grid(row=10, column=0, sticky="nsew")
+        b.rowconfigure(10, weight=1)
+
+        end = ttk.Frame(b)
+        end.grid(row=11, column=0, sticky="ew", pady=(10,0))
+        self.btn_batch = ttk.Button(end, text="Analyse these files…", state=tk.DISABLED,
+                                    command=lambda: BatchWindow(self.app, [self.output]))
+        self.btn_batch.pack(side=tk.LEFT)
+        self.btn_folder = ttk.Button(end, text="Open folder", state=tk.DISABLED, command=lambda: open_path(self.output))
+        self.btn_folder.pack(side=tk.LEFT, padx=6)
+        self._switch()
+
+    def _switch(self):
+        key = self.dataset.get()
+        _, n, hint = self.DATASETS[key]
+        self.n.set(str(n))
+        self.source_hint.config(text=hint)
+        for w in self.pk_rows:
+            w.grid() if key == "parkinsense" else w.grid_remove()
+
+    def _choose_source(self):
+        path = self.app._ask_folder("Dataset folder", parent=self)
+        if path:
+            self.source.set(path)
+            if not self.output_var.get():
+                self.output_var.set(os.path.join(os.path.dirname(path), f"{self.dataset.get()}_series"))
+
+    def _choose_demographics(self):
+        fp = self.app._ask_open("Demographics file", (".xlsx", ".xls"), "Excel", parent=self)
+        if fp:
+            self.demographics.set(fp)
+
+    def _choose_output(self):
+        path = self.app._ask_folder("Output folder", parent=self)
+        if path:
+            self.output_var.set(path)
+
+    def _write(self, line):
+        self.log.config(state=tk.NORMAL)
+        self.log.insert(tk.END, line + "\n")
+        self.log.see(tk.END)
+        self.log.config(state=tk.DISABLED)
+
+    def _run(self):
+        key = self.dataset.get()
+        source, output = self.source.get().strip(), self.output_var.get().strip()
+        try:
+            n = int(self.n.get())
+            if n < 4:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Check the options", "Values per subject must be a whole number ≥ 4.", parent=self)
+            return
+        missing = [name for name, v in (("the dataset folder", source), ("the output folder", output)) if not v]
+        if key == "parkinsense" and not self.demographics.get().strip():
+            missing.append("the demographics file")
+        if missing:
+            messagebox.showerror("Check the options", "Choose " + " and ".join(missing) + ".", parent=self)
+            return
+        if key == "parkinsense":
+            test = self.test.get()[0]
+            job = lambda log: giroscopio_a_serie.convertir(source, self.demographics.get().strip(), output, test, n, log)
+        else:
+            job = lambda log: gaitndd_a_serie.convertir(source, output, n, log)
+
+        self.output = output
+        self.running = True
+        self.btn_run.config(state=tk.DISABLED)
+        for btn in (self.btn_batch, self.btn_folder):
+            btn.config(state=tk.DISABLED)
+        self.log.config(state=tk.NORMAL)
+        self.log.delete("1.0", tk.END)
+        self.log.config(state=tk.DISABLED)
+        self.bar.config(mode="indeterminate")
+        self.bar.start(12)
+
+        def work():
+            try:
+                counts = job(lambda line: self._post(lambda: self._write(line)))
+                self._post(lambda: self._done(counts))
+            except Exception as e:
+                self._post(lambda err=e: self._failed(err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish(self):
+        self.running = False
+        self.bar.stop()
+        self.bar.config(mode="determinate", value=0)
+        self.btn_run.config(state=tk.NORMAL)
+
+    def _failed(self, error):
+        self._finish()
+        messagebox.showerror("Could not convert", str(error), parent=self)
+
+    def _done(self, counts):
+        self._finish()
+        skipped = counts.pop("skipped")
+        written = sum(counts.values())
+        self._write("")
+        self._write(f"{written} files written ({', '.join(f'{g}: {c}' for g, c in counts.items())}); {skipped} skipped.")
+        if written:
+            for btn in (self.btn_batch, self.btn_folder):
+                btn.config(state=tk.NORMAL)
+
+
+class HelpWindow(tk.Toplevel):
+    TEXT = (
+        ("Analyse one recording", (
+            "1. Click Browse and open a data file with one number per line, for example RR intervals in seconds. "
+            "ParkinSenseDB data.csv and PhysioNet .ts gait files are converted automatically. Example files are in "
+            "the App data folder.",
+            "2. Under Sierpinski Triangle or Tetrahedron, click Control, Patient or Random. Control and Patient compute "
+            "the same thing and only change the colour, so groups can be told apart in figures. Random shows a series "
+            "without structure, for reference.",
+            "3. Read D under Fractal Dimension. Save Image also saves a .json file with every parameter used.")),
+        ("What D means", (
+            "D measures how completely the series fills the fractal. Values near the maximum (1.585 for the triangle, "
+            "2 for the tetrahedron, with address counting) mean the order of the values is close to random; lower "
+            "values mean repeated patterns or slow trends.",
+            "With the classic estimator D also depends on the number of values, so compare series of the same length "
+            "(Settings → Use first n values) or choose address counting.")),
+        ("Analyse many files", (
+            "Tools → Batch analysis. Put each group in its own folder (for example controls and patients), add the "
+            "folders and press Run. You get one table with a row per file, and the window shows the mean and SD of "
+            "each group.",)),
+        ("Convert a gait dataset", (
+            "Tools → Convert dataset turns ParkinSenseDB or PhysioNet gaitndd into one file per subject, sorted by "
+            "group, ready for batch analysis.",)),
+        ("Statistics", (
+            "Statistics… adds a confidence interval for D (bootstrap), a test against shuffled copies of the series "
+            "(surrogates), D at several time scales, and other HRV measures.",)),
+    )
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.title("Help")
+        self.configure(bg=UI["bg"])
+        self.geometry("680x640")
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="How to use FractalApp", style="Title.TLabel").pack(anchor="w")
+        text = tk.Text(body, bg=UI["bg"], fg=UI["text"], relief="flat", wrap="word", padx=0, pady=10,
+                       highlightthickness=0, font=(app.family, 10), spacing1=2, spacing3=6)
+        text.tag_configure("h", font=(app.family, 11, "bold"), foreground=UI["accent"], spacing1=12)
+        for heading, paragraphs in self.TEXT:
+            text.insert(tk.END, heading + "\n", "h")
+            for p in paragraphs:
+                text.insert(tk.END, p + "\n")
+        text.config(state=tk.DISABLED)
+        text.pack(fill=tk.BOTH, expand=True)
+        bar = ttk.Frame(body)
+        bar.pack(fill=tk.X, pady=(10,0))
+        ttk.Button(bar, text="Full guide (online)", command=lambda: webbrowser.open(GUIDE_URL)).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+        self.bind("<Escape>", lambda e: self.destroy())
+
+
 class FractalApp:
     def __init__(self):
         self.root = tk.Tk()
@@ -661,11 +1231,15 @@ class FractalApp:
         ttk.Checkbutton(side, text="White plot background", variable=self.light_plot,
                         command=self._render).grid(row=16, column=0, columnspan=3, sticky="w", pady=(8,0))
 
-        # Instrucciones
-        self._section(side, "Notes", 17)
-        ttk.Label(side, style="Muted.TLabel", justify="left",
-                  text="Single-column files; gyroscope CSV and .ts\nfiles are converted on load. Triangle uses 3\nlabels, tetrahedron 4, Random random labels.\nSaved images get a .json with all parameters."
-                  ).grid(row=18, column=0, columnspan=3, sticky="w")
+        # Herramientas
+        self._section(side, "Tools", 17)
+        ttk.Button(side, text="Batch analysis…", command=lambda: BatchWindow(self)).grid(
+            row=18, column=0, columnspan=3, sticky="ew", pady=(0,4))
+        ttk.Button(side, text="Convert dataset…", command=lambda: ConvertWindow(self)).grid(
+            row=19, column=0, columnspan=2, sticky="ew", padx=(0,3))
+        ttk.Button(side, text="Help", command=lambda: HelpWindow(self)).grid(row=19, column=2, sticky="ew", padx=(3,0))
+        self.root.bind("<F1>", lambda e: HelpWindow(self))
+        self.root.bind("<Control-o>", lambda e: self.browse_file())
 
         # ====== Panel de gráfica ======
         self.frame_plot = ttk.Frame(main)
@@ -701,6 +1275,7 @@ class FractalApp:
     def _setup_style(self):
         families = set(tkfont.families(self.root))
         family = next((f for f in ("Segoe UI", "Inter", "Cantarell", "Noto Sans", "DejaVu Sans") if f in families), tkfont.nametofont("TkDefaultFont", root=self.root).actual("family"))
+        self.family = family
 
         style = ttk.Style(self.root)
         style.theme_use("clam")
@@ -710,6 +1285,7 @@ class FractalApp:
         style.configure("Card.TFrame", background=UI["card"])
         style.configure("Title.TLabel", font=(family, 15, "bold"))
         style.configure("Section.TLabel", font=(family, 10, "bold"), foreground=UI["muted"])
+        style.configure("Step.TLabel", font=(family, 11, "bold"), foreground=UI["accent"])
         style.configure("Muted.TLabel", font=(family, 9), foreground=UI["muted"])
         style.configure("Metric.TLabel", font=(family, 22, "bold"), background=UI["card"])
         style.configure("CardMuted.TLabel", font=(family, 9), foreground=UI["muted"], background=UI["card"])
@@ -723,12 +1299,19 @@ class FractalApp:
         for name, (base, hover) in filled.items():
             style.configure(f"{name}.TButton", background=base, foreground="#ffffff",
                             bordercolor=base, lightcolor=base, darkcolor=base)
-            style.map(f"{name}.TButton", background=[("active", hover)],
-                      lightcolor=[("active", hover)], darkcolor=[("active", hover)])
+            style.map(f"{name}.TButton", background=[("disabled", UI["card"]), ("active", hover)],
+                      foreground=[("disabled", UI["disabled"])], bordercolor=[("disabled", UI["card"])],
+                      lightcolor=[("disabled", UI["card"]), ("active", hover)],
+                      darkcolor=[("disabled", UI["card"]), ("active", hover)])
 
         style.configure("TCheckbutton", font=(family, 9), foreground=UI["muted"], indicatorbackground=UI["card"])
         style.map("TCheckbutton", background=[("active", UI["bg"])],
                   indicatorbackground=[("selected", UI["accent"])])
+        style.configure("TRadiobutton", font=(family, 10), foreground=UI["text"], indicatorbackground=UI["card"])
+        style.map("TRadiobutton", background=[("active", UI["bg"])],
+                  indicatorbackground=[("selected", UI["accent"])])
+        style.configure("Horizontal.TProgressbar", background=UI["accent"], troughcolor=UI["card"],
+                        bordercolor=UI["border"], lightcolor=UI["accent"], darkcolor=UI["accent"])
 
         style.configure("Place.TButton", background=UI["bg"], foreground=UI["text"], anchor="w",
                         bordercolor=UI["bg"], lightcolor=UI["bg"], darkcolor=UI["bg"], width=11)
@@ -763,22 +1346,47 @@ class FractalApp:
     def _uses_tk_dialogs(self):
         return self.root.tk.call("tk", "windowingsystem") == "x11"
 
-    def _ask_open(self):
+    def _ask_open(self, title="Open data file", extensions=DATA_EXTENSIONS, label="Data files", parent=None):
+        parent = parent or self.root
         if self._uses_tk_dialogs():
-            fp = FileBrowser(self.root, "Open data file", (".txt", ".csv", ".dat", ".ts"), self._start_dir()).show()
+            fp = FileBrowser(parent, title, extensions, self._start_dir()).show()
         else:
-            fp = filedialog.askopenfilename(initialdir=self._start_dir(),
-                                            filetypes=[("Text or CSV", ("*.txt", "*.csv", "*.dat", "*.ts")), ("All", "*.*")])
+            fp = filedialog.askopenfilename(parent=parent, title=title, initialdir=self._start_dir(),
+                                            filetypes=[(label, tuple(f"*{e}" for e in extensions)), ("All", "*.*")])
         if fp:
             self.last_dir = os.path.dirname(fp)
         return fp
 
-    def _ask_save(self, extension, label, initial=None):
-        initial = initial or f"sierpinski_{self.kind}_{self.mode}{extension}"
+    def _ask_open_many(self, parent=None):
+        # El explorador propio de X11 elige un archivo a la vez
         if self._uses_tk_dialogs():
-            fp = FileBrowser(self.root, f"Save {label}", (extension,), self._start_dir(), save=True, initial=initial).show()
+            fp = self._ask_open("Add data file", parent=parent)
+            return [fp] if fp else []
+        files = filedialog.askopenfilenames(parent=parent or self.root, title="Add data files", initialdir=self._start_dir(),
+                                            filetypes=[("Data files", tuple(f"*{e}" for e in DATA_EXTENSIONS)), ("All", "*.*")])
+        if files:
+            self.last_dir = os.path.dirname(files[0])
+        return list(files)
+
+    def _ask_folder(self, title, parent=None):
+        if self._uses_tk_dialogs():
+            path = FileBrowser(parent or self.root, title, (), self._start_dir(), folder=True).show()
         else:
-            fp = filedialog.asksaveasfilename(initialdir=self._start_dir(), initialfile=initial,
+            path = filedialog.askdirectory(parent=parent or self.root, title=title, initialdir=self._start_dir())
+        if path:
+            self.last_dir = path
+        return path
+
+    def _ask_save(self, extension, label, initial=None, parent=None):
+        initial = initial or f"sierpinski_{self.kind}_{self.mode}{extension}"
+        # La carpeta de ejemplos del ejecutable es temporal: no se guarda ahí
+        start = self._start_dir()
+        if in_bundle(start):
+            start = documents_dir()
+        if self._uses_tk_dialogs():
+            fp = FileBrowser(parent or self.root, f"Save {label}", (extension,), start, save=True, initial=initial).show()
+        else:
+            fp = filedialog.asksaveasfilename(parent=parent or self.root, initialdir=start, initialfile=initial,
                                               defaultextension=extension, filetypes=[(label, f"*{extension}")])
         if fp:
             self.last_dir = os.path.dirname(fp)
@@ -810,15 +1418,19 @@ class FractalApp:
             lines.append(f"Converted: {self.source}")
         self.file_label.config(text="\n".join(lines))
 
-    def _update_settings_label(self):
+    def preprocessing_text(self):
         s = self.settings
         steps = []
         if s.outlier_mad > 0: steps.append(f"outliers > {s.outlier_mad:g} SD")
         if s.detrend_window > 1: steps.append(f"detrend {s.detrend_window}")
         if s.scale > 1: steps.append(f"scale τ = {s.scale}")
         if s.max_n > 0: steps.append(f"first {s.max_n:,} values")
+        return ", ".join(steps) if steps else "No preprocessing"
+
+    def _update_settings_label(self):
+        s = self.settings
         seed = f" · seed {s.seed}" if s.seed is not None else ""
-        self.settings_label.config(text=f"{ESTIMATOR_SHORT[s.estimator]}{seed}\n" + (", ".join(steps) if steps else "No preprocessing"))
+        self.settings_label.config(text=f"{ESTIMATOR_SHORT[s.estimator]}{seed}\n{self.preprocessing_text()}")
 
     # ---------------- FRACTALES ----------------
     def generate_triangle(self, mode):

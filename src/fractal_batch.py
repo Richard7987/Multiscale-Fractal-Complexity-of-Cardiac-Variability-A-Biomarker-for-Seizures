@@ -9,6 +9,7 @@ Ejemplos:
 
 Acepta los mismos formatos que la aplicación (una columna, CSV de giroscopio
 de ParkinSenseDB y .ts de gaitndd). Sin opciones, el cálculo es el de la app.
+La interfaz gráfica usa run() y summarize() con las mismas opciones.
 """
 import argparse
 import csv
@@ -22,6 +23,7 @@ import numpy as np
 import fractal_core as fc
 
 EXTENSIONS = (".txt", ".csv", ".dat", ".ts")
+TAGS = {"triangle": "D2", "tetrahedron": "D3"}
 
 
 def collect(paths):
@@ -37,25 +39,81 @@ def collect(paths):
     return sorted(files)
 
 
-def analyse(path, args, settings, rng):
+def analyse(path, settings, figures, bootstrap=0, block=None, surrogates=0, surrogate_method="shuffle",
+            scales=(), measures=False, rng=None):
     raw, source = fc.load_series(path)
     y, info = fc.preprocess(raw, settings)
-    row = {"file": path, "conversion": source or "", **info}
-    for kind in args.figures:
-        tag = "D2" if kind == "triangle" else "D3"
+    row = {"file": path, "group": os.path.basename(os.path.dirname(path)), "conversion": source or "", **info}
+    for kind in figures:
+        tag = TAGS[kind]
         row[tag] = fc.series_dimension(y, kind, settings.estimator)
-        if args.bootstrap:
-            b = fc.bootstrap_ci(y, kind, settings.estimator, B=args.bootstrap, block=args.block, rng=rng)
+        if bootstrap:
+            b = fc.bootstrap_ci(y, kind, settings.estimator, B=bootstrap, block=block, rng=rng)
             row[f"{tag}_ci_low"], row[f"{tag}_ci_high"] = b["ci_low"], b["ci_high"]
             row[f"{tag}_se"], row[f"{tag}_bias"] = b["se"], b["bias"]
-        if args.surrogates:
-            s = fc.surrogate_test(y, kind, settings.estimator, M=args.surrogates, method=args.surrogate_method, rng=rng)
+        if surrogates:
+            s = fc.surrogate_test(y, kind, settings.estimator, M=surrogates, method=surrogate_method, rng=rng)
             row[f"{tag}_surrogate_mean"], row[f"{tag}_z"], row[f"{tag}_p"] = s["surrogate_mean"], s["z"], s["p"]
-        for r in fc.multiscale(y, kind, settings.estimator, args.scales) if args.scales else []:
+        for r in fc.multiscale(y, kind, settings.estimator, scales) if scales else []:
             row[f"{tag}_scale{r['scale']}"] = r["D"]
-    if args.measures:
+    if measures:
         row.update(fc.measures(y))
     return row
+
+
+def run(inputs, output, settings, figures=("triangle", "tetrahedron"), bootstrap=0, block=None, surrogates=0,
+        surrogate_method="shuffle", scales=(), measures=False, seed=None, progress=None, cancel=None):
+    """Analiza los archivos y escribe output (CSV) y su .json. progress(i, total, path, error) informa cada archivo;
+    si cancel (threading.Event) se activa, se guarda lo calculado hasta ese momento."""
+    files = collect(inputs)
+    if not files:
+        raise ValueError("No data files (.txt, .csv, .dat, .ts) were found in the chosen folders.")
+    seed = seed if seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
+    rng = np.random.default_rng(seed)
+
+    rows = []
+    for i, path in enumerate(files, 1):
+        if cancel is not None and cancel.is_set():
+            break
+        try:
+            row = analyse(path, settings, figures, bootstrap, block, surrogates, surrogate_method, scales, measures, rng)
+        except Exception as e:
+            row = {"file": path, "group": os.path.basename(os.path.dirname(path)), "error": str(e)}
+        rows.append(row)
+        if progress:
+            progress(i, len(files), path, row.get("error"))
+
+    fields = list(dict.fromkeys(k for r in rows for k in r))
+    with open(output, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+
+    meta = {"fractalapp_version": fc.__version__, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "settings": settings.to_dict(), "figures": list(figures), "bootstrap": bootstrap, "block": block,
+            "surrogates": surrogates, "surrogate_method": surrogate_method, "scales": list(scales),
+            "measures": measures, "seed": seed, "files": len(rows), "files_found": len(files),
+            "cancelled": len(rows) < len(files)}
+    with open(os.path.splitext(output)[0] + ".json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    return rows, meta
+
+
+def summarize(rows):
+    """Media, DE y número de archivos de D2 y D3 por grupo (carpeta que contiene cada archivo)."""
+    groups = {}
+    for r in rows:
+        groups.setdefault(r["group"], []).append(r)
+    summary = []
+    for name in sorted(groups):
+        g = groups[name]
+        item = {"group": name, "files": len(g), "errors": sum("error" in r for r in g)}
+        for tag in TAGS.values():
+            v = np.array([r[tag] for r in g if tag in r], dtype=float)
+            if len(v):
+                item[tag] = (float(v.mean()), float(v.std(ddof=1)) if len(v) > 1 else float("nan"), len(v))
+        summary.append(item)
+    return summary
 
 
 def main():
@@ -76,35 +134,25 @@ def main():
     ap.add_argument("--measures", action="store_true", help="add mean, SD, CV, RMSSD, DFA alpha and sample entropy")
     ap.add_argument("--seed", type=int, default=None, help="seed for bootstrap and surrogates")
     args = ap.parse_args()
-    args.figures = [f.strip() for f in args.figures.split(",") if f.strip()]
-    args.scales = [int(s) for s in args.scales.split(",") if s.strip()]
 
     settings = fc.Settings(estimator=args.estimator, outlier_mad=args.outlier_mad,
                            detrend_window=args.detrend, scale=args.scale, max_n=args.max_n)
-    seed = args.seed if args.seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
-    rng = np.random.default_rng(seed)
 
-    rows = []
-    for path in collect(args.inputs):
-        try:
-            rows.append(analyse(path, args, settings, rng))
+    def report(i, total, path, error):
+        if error:
+            print(f"err {path}: {error}", file=sys.stderr)
+        else:
             print(f"ok  {path}")
-        except Exception as e:
-            rows.append({"file": path, "error": str(e)})
-            print(f"err {path}: {e}", file=sys.stderr)
 
-    fields = list(dict.fromkeys(k for r in rows for k in r))
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(rows)
-
-    meta = {"fractalapp_version": fc.__version__, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "settings": settings.to_dict(), "figures": args.figures, "bootstrap": args.bootstrap, "block": args.block,
-            "surrogates": args.surrogates, "surrogate_method": args.surrogate_method, "scales": args.scales,
-            "measures": args.measures, "seed": seed, "files": len(rows)}
-    with open(os.path.splitext(args.output)[0] + ".json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False)
+    try:
+        rows, _ = run(args.inputs, args.output, settings,
+                      figures=[f.strip() for f in args.figures.split(",") if f.strip()],
+                      bootstrap=args.bootstrap, block=args.block, surrogates=args.surrogates,
+                      surrogate_method=args.surrogate_method,
+                      scales=[int(s) for s in args.scales.split(",") if s.strip()],
+                      measures=args.measures, seed=args.seed, progress=report)
+    except ValueError as e:
+        sys.exit(str(e))
     print(f"{len(rows)} files -> {args.output}")
 
 

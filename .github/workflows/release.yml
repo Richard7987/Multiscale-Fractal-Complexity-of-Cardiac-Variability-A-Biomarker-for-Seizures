@@ -46,7 +46,16 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt pyinstaller
-      - run: pyinstaller --onefile --windowed --name FractalApp --paths src src/interfaz2d3d.py
+      - name: Build
+        shell: bash
+        run: >
+          pyinstaller --onefile --windowed --name FractalApp --paths src
+          --add-data "data/controls:data/controls"
+          --add-data "data/epileptics:data/epileptics"
+          --add-data "data/states/PREICTAL/Preictal.txt:data/states/PREICTAL"
+          --add-data "data/states/ICTAL/Ictal.txt:data/states/ICTAL"
+          --add-data "data/states/POSTICTAL/Postictal.txt:data/states/POSTICTAL"
+          src/interfaz2d3d.py
       - name: Rename
         shell: bash
         run: mv "${{ matrix.built }}" "${{ matrix.asset }}"

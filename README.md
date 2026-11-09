@@ -14,6 +14,8 @@ Fractal dimension of physiological time series (heart rate variability, gait) th
 
 Windows and Linux executables are attached to each [release](https://github.com/Richard7987/Multiscale-Fractal-Complexity-of-Cardiac-Variability-A-Biomarker-for-Seizures/releases/latest). No Python installation is needed.
 
+The app analyses single recordings, whole folders (*Tools → Batch analysis*) and public gait datasets (*Tools → Convert dataset*), with example data included; *Help* explains each step. Windows may warn that the file is from an unknown publisher: choose *More info → Run anyway*.
+
 ## Run from source
 
 Requires Python 3.9+ with Tkinter.
@@ -25,7 +27,7 @@ python src/interfaz2d3d.py
 
 Open a series with **Browse**, then choose **Control**, **Patient** or **Random** under the triangle or tetrahedron. Example RR series are in `data/`.
 
-Whole folders can be analysed from the command line:
+Whole folders can also be analysed from the command line:
 
 ```bash
 python src/fractal_batch.py data/controls data/epileptics -o results.csv

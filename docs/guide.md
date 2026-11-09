@@ -10,6 +10,7 @@ Detailed reference for [FractalApp](../README.md): method, settings, statistics,
 - [Batch mode](#batch-mode)
 - [Converting whole datasets](#converting-whole-datasets)
 - [Testing](#testing)
+- [Changes in version 1.2](#changes-in-version-12)
 - [Changes in version 1.1](#changes-in-version-11)
 - [Releases](#releases)
 
@@ -103,7 +104,11 @@ A converted file keeps all its valid samples, so its length depends on the recor
 
 ## Batch mode
 
-`fractal_batch.py` analyses many files at once with the same options as the application and writes one CSV row per file, plus a JSON file with the parameters, the program version and the seed. Folders are searched recursively for `.txt`, `.csv`, `.dat` and `.ts` files; the conversions of the application apply. A file that cannot be read gets an `error` column instead of stopping the run.
+**In the app:** *Tools → Batch analysis…*. Add one or more folders, choose what to compute and where to save the table, and press *Run*. The analysis uses the current *Settings*. When it finishes, the window shows the mean and SD of `D2` and `D3` for each group, and *Open table* opens the CSV in the spreadsheet program. *Use example data* adds the example controls and patients.
+
+**From the command line:** `fractal_batch.py` takes the same options.
+
+Both write one CSV row per file, plus a JSON file with the parameters, the program version and the seed. Folders are searched recursively for `.txt`, `.csv`, `.dat` and `.ts` files; the conversions of the application apply. Each row's `group` is the name of the folder that holds the file. A file that cannot be read gets an `error` column instead of stopping the run.
 
 ```bash
 # Default settings: the same D2 and D3 as the application
@@ -131,7 +136,9 @@ Every row also reports `n_raw`, `n_nonfinite_removed`, `n_outliers_corrected` an
 
 ## Converting whole datasets
 
-The same converters can be run from the command line on a complete dataset. They write one single-column `.txt` file per subject, all with the same length `n`, sorted into one folder per group. Subjects with fewer than `n` valid samples are skipped. These files can then be opened in the app like any other series. The gait conversions are not part of the published HRV analysis.
+**In the app:** *Tools → Convert dataset…*. Choose the dataset, its folder (and, for ParkinSenseDB, the demographics spreadsheet and the test), the number of values per subject and an output folder, then press *Convert*. *Analyse these files…* opens the batch analysis with the converted folder.
+
+**From the command line:** the commands below do the same. The converters write one single-column `.txt` file per subject, all with the same length `n`, sorted into one folder per group. Subjects with fewer than `n` valid samples are skipped. These files can then be opened in the app like any other series. The gait conversions are not part of the published HRV analysis.
 
 **ParkinSenseDB (inertial sensors, 100 Hz).** Computes `VM_ω` for every repetition of one test (A: simple walk, B: narrowing walk, C: change of direction, D: Timed Up and Go), concatenates the repetitions in order, and writes the first `n` samples of each subject into `controls/` and `parkinson/`. The demographics spreadsheet supplies each subject's group.
 
@@ -168,6 +175,16 @@ The same tests run automatically in GitHub Actions (`.github/workflows/tests.yml
 
 ---
 
+## Changes in version 1.2
+
+- Batch analysis and dataset conversion are available in the app (*Tools*), so the executables can do everything the scripts do.
+- Help window (*Help* or F1) with a quick start.
+- The executables include the example data.
+- The batch table has a `group` column.
+- Fixed: the Statistics window could stay at *Computing…* without showing results, because the calculation thread called Tk directly.
+
+---
+
 ## Changes in version 1.1
 
 - Computation moved to `fractal_core.py`, shared by the application, the batch mode and the tests.
@@ -182,6 +199,6 @@ The same tests run automatically in GitHub Actions (`.github/workflows/tests.yml
 Pushing a tag `vX.Y.Z` that matches `__version__` in `src/fractal_core.py` runs the tests, builds the executables with PyInstaller on Windows and Linux, and publishes them in a GitHub release (`.github/workflows/release.yml`).
 
 ```bash
-git tag v1.1.0
-git push origin v1.1.0
+git tag -m "FractalApp v1.2.0" v1.2.0
+git push origin v1.2.0
 ```

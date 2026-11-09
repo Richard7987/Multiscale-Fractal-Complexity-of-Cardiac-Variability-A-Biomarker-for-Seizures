@@ -52,28 +52,47 @@ def serie_sujeto(carpeta, prueba):
     return np.concatenate([magnitud_giroscopio(a) for a in archivos])
 
 
+def convertir(dataset, demografia, salida, prueba="A", n=4000, log=print):
+    """Escribe un .txt de n valores por sujeto en salida/controls y salida/parkinson; devuelve cuántos por grupo."""
+    if not os.path.isdir(dataset):
+        raise ValueError(f"Dataset folder not found: {dataset}")
+    status = leer_demografia(demografia)
+    grupos = {"Control": "controls", "PD": "parkinson"}
+    sujetos = [s for s in sorted(os.listdir(dataset)) if os.path.isdir(os.path.join(dataset, s, f"TEST {prueba}"))]
+    if not sujetos:
+        raise ValueError(f'No subject folders with a "TEST {prueba}" folder inside {dataset}. '
+                         "Choose the Full_Dataset folder, which holds one folder per subject.")
+    for g in grupos.values():
+        os.makedirs(os.path.join(salida, g), exist_ok=True)
+
+    conteo = {"controls": 0, "parkinson": 0, "skipped": 0}
+    for sid in sujetos:
+        grupo = grupos.get(status.get(sid))
+        if grupo is None:
+            log(f"{sid}: not in the demographics file, skipped")
+            conteo["skipped"] += 1
+            continue
+        y = serie_sujeto(os.path.join(dataset, sid), prueba)
+        if len(y) < n:
+            log(f"{sid}: only {len(y)} samples (< {n}), skipped")
+            conteo["skipped"] += 1
+            continue
+        np.savetxt(os.path.join(salida, grupo, f"{sid}_test{prueba}.txt"), y[:n], fmt="%.3f")
+        conteo[grupo] += 1
+        log(f"{sid} ({status[sid]}): {n} samples -> {grupo}")
+    return conteo
+
+
 def main():
     if len(sys.argv) < 4:
         sys.exit(__doc__)
     dataset, demografia, salida = sys.argv[1:4]
     prueba = sys.argv[4] if len(sys.argv) > 4 else "A"
     n = int(sys.argv[5]) if len(sys.argv) > 5 else 4000
-
-    status = leer_demografia(demografia)
-    grupos = {"Control": "controls", "PD": "parkinson"}
-    for g in grupos.values():
-        os.makedirs(os.path.join(salida, g), exist_ok=True)
-
-    for sid in sorted(os.listdir(dataset)):
-        grupo = grupos.get(status.get(sid))
-        if grupo is None:
-            continue
-        y = serie_sujeto(os.path.join(dataset, sid), prueba)
-        if len(y) < n:
-            print(f"{sid}: solo {len(y)} muestras, se omite")
-            continue
-        np.savetxt(os.path.join(salida, grupo, f"{sid}_test{prueba}.txt"), y[:n], fmt="%.3f")
-        print(f"{sid} ({status[sid]}): {n} muestras")
+    try:
+        convertir(dataset, demografia, salida, prueba, n)
+    except ValueError as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":

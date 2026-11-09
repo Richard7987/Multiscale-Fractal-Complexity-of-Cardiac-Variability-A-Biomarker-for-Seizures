@@ -14,7 +14,7 @@ import pandas as pd
 from giroscopio_a_serie import magnitud_giroscopio
 from gaitndd_a_serie import intervalos_zancada
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 TRIANGLE_VERTS = np.array([
     [0, 0],

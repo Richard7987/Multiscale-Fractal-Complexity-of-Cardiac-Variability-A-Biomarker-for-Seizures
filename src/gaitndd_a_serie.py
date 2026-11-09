@@ -32,23 +32,44 @@ def intervalos_zancada(ts):
     return x[np.abs(x - np.median(x)) < 3 * x.std()]
 
 
+def convertir(origen, salida, n=190, log=print):
+    """Escribe un .txt de n zancadas por sujeto en una carpeta por grupo; devuelve cuántos por grupo."""
+    archivos = sorted(glob.glob(os.path.join(origen, "*.ts")))
+    if not archivos:
+        raise ValueError(f"No .ts files in {origen}. Choose the gaitndd folder that holds the .ts records "
+                         "(for example gaitndd/1.0.0).")
+    for g in GRUPOS.values():
+        os.makedirs(os.path.join(salida, g), exist_ok=True)
+
+    conteo = {g: 0 for g in GRUPOS.values()}
+    conteo["skipped"] = 0
+    for ts in archivos:
+        sid = os.path.basename(ts)[:-3]
+        grupo = GRUPOS.get(re.sub(r"\d+", "", sid))
+        if grupo is None:
+            log(f"{sid}: unknown group, skipped")
+            conteo["skipped"] += 1
+            continue
+        x = intervalos_zancada(ts)
+        if len(x) < n:
+            log(f"{sid}: only {len(x)} strides (< {n}), skipped")
+            conteo["skipped"] += 1
+            continue
+        np.savetxt(os.path.join(salida, grupo, f"{sid}.txt"), x[:n], fmt="%.4f")
+        conteo[grupo] += 1
+        log(f"{sid}: {n} strides -> {grupo}")
+    return conteo
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     origen, salida = sys.argv[1:3]
     n = int(sys.argv[3]) if len(sys.argv) > 3 else 190
-
-    for g in GRUPOS.values():
-        os.makedirs(os.path.join(salida, g), exist_ok=True)
-
-    for ts in sorted(glob.glob(os.path.join(origen, "*.ts"))):
-        sid = os.path.basename(ts)[:-3]
-        grupo = GRUPOS[re.sub(r"\d+", "", sid)]
-        x = intervalos_zancada(ts)
-        if len(x) < n:
-            print(f"{sid}: solo {len(x)} zancadas, se omite")
-            continue
-        np.savetxt(os.path.join(salida, grupo, f"{sid}.txt"), x[:n], fmt="%.4f")
+    try:
+        convertir(origen, salida, n)
+    except ValueError as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":
